@@ -1425,6 +1425,10 @@ def review_server(src: Path, host: str = "127.0.0.1", port: int = 8765):
             try:
                 if u.path == "/":
                     return self.send(200, REVIEW_PAGE.replace("__TOKEN__", token), "text/html; charset=utf-8")
+                if u.path == "/favicon.ico":
+                    self.send_response(204)
+                    self.end_headers()
+                    return None
                 if u.path == "/api/summary":
                     return self.send(200, rv.summary())
                 if u.path == "/api/list":
