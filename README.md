@@ -18,6 +18,9 @@ jq-lore/
 
 One file, standard library only, Python 3.9+. No services, no embeddings, no network at lookup time.
 
+**Setting it up at a site?** Follow [docs/RUNBOOK.md](docs/RUNBOOK.md): a step-by-step procedure (for a person
+or an agent) from documentation and command-line tools to installed skills and a working workspace.
+
 ## Use a lore
 
 ```sh

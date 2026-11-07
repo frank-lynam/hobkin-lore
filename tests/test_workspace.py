@@ -172,6 +172,35 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaises(hl.LoreError):
             ws.path_for("PeopleCode", "../../etc/passwd")
 
+    def test_shared_files_hold_no_machine_paths(self):
+        home = Path.home()
+        self.assertEqual(hl.portable(home / ".claude/skills/x-lore/x.lore.db", self.tmp), "~/.claude/skills/x-lore/x.lore.db")
+        self.assertEqual(hl.portable(home / "a/lore.py", self.tmp, vscode=True), "${userHome}/a/lore.py")
+        self.assertEqual(hl.portable(self.tmp / "tools/x.lore.db", self.tmp), "tools/x.lore.db")
+        # a lore inside the repo: the config points at it relatively, and a clone elsewhere still works
+        d = self.tmp / "dev1"
+        d.mkdir()
+        shutil.copyfile(self.lore, d / "ps.lore.db")
+        self.assertEqual(run("ws", "init", "ps.lore.db", cwd=d)[0], 0)
+        self.assertEqual(json.loads((d / ".lore-workspace" / "config.json").read_text())["lore"], "ps.lore.db")
+        moved = self.tmp / "moved"
+        shutil.copytree(d, moved)
+        self.assertEqual(hl.Workspace(moved).lore.meta["name"], "jq")
+
+    def test_missing_objects(self):
+        d = self.repo("dev1")
+        ws = hl.Workspace(d)
+        self.assertIsNone(ws.fetch("SQL", "NO_SUCH"))                       # the CLI said "object not found"
+        ws.ops["operations"]["pull"]["command"] = "true {file}"          # "succeeds", writes nothing
+        self.assertIsNone(ws.fetch("SQL", "HR_ACTIVE"))
+        ws.ops["operations"]["pull"] = {"command": f"{FAKEPS} export -db {{db}} -type {{type}} -name {{name}} "
+                                                   f"-out {{file}}", "missing": "mystery wording"}
+        ws.ops["operations"]["pull"]["command"] = "echo mystery wording {name}"
+        ws.ops["operations"]["pull"]["output"] = "stdout"
+        self.assertIsNone(ws.fetch("SQL", "HR_ACTIVE"))                    # the site's own "no such object"
+        self.assertEqual(hl.check_operations({"operations": {"pull": {"command": "x", "missing": "("}}}),
+                         ["operation 'pull': missing: missing ), unterminated subpattern at position 0"])
+
     def test_the_skill_says_how_and_broken_operations_dont_compile(self):
         lore = hl.Lore(self.lore)
         md = hl.skill_md(lore.meta, True, True)

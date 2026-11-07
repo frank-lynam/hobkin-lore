@@ -48,7 +48,7 @@ Standard library only; Python 3.9+. See README.md for the pack source format.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import difflib
@@ -115,7 +115,8 @@ SOURCE_FILES = ("pack.json", "sections.jsonl", "symbols.jsonl", "tools.jsonl", "
 OPERATIONS = {         # what the lore's operations.json may define; {placeholders} each one is given
     "list": "the objects of a {type}, one per line of output (parsed with `parse`)",
     "project_list": "the objects in a {project}, one per line of output (parsed with `parse`)",
-    "pull": "copies object {type} {name} from the database into {file} (or prints it: \"output\": \"stdout\")",
+    "pull": "copies object {type} {name} from the database into {file} (or prints it: \"output\": \"stdout\"); "
+            "\"missing\": a regex for its message when there's no such object",
     "deploy": "copies {file} into the database as object {type} {name}",
     "validate": "checks {file} (object {type} {name}) without changing the database",
     "compile": "compiles object {type} {name} in the database",
@@ -147,6 +148,11 @@ def check_operations(ops: dict) -> list[str]:
                 if ph not in known:
                     problems.append(f"operation {name!r}: {{{ph}}} isn't a variable, a secret or one of "
                                     f"{', '.join(OBJECT_KEYS)}")
+        if op.get("missing"):
+            try:
+                re.compile(op["missing"])
+            except re.error as e:
+                problems.append(f"operation {name!r}: missing: {e}")
         if op.get("parse"):
             try:
                 rx = re.compile(op["parse"])
@@ -1674,6 +1680,7 @@ def review_server(src: Path, host: str = "127.0.0.1", port: int = 8765):
 # ---- workspace: code that lives in a database, worked from a git repo through the lore's tools
 
 WS_DIR = ".lore-workspace"
+MISSING = r"not found|no such|does not exist|unknown object|doesn't exist|no rows"   # a pull's "there's none"
 class Workspace:
     """A git repo (or any folder) holding code that lives in a database: files laid out as ROOT/TYPE/NAME.EXT,
     worked through the lore's operations. `.lore-workspace/config.json` says which lore and the site's
@@ -1773,12 +1780,14 @@ class Workspace:
             try:
                 r = self.run("pull", type=otype, name=name, file=f, dir=tmp)
             except LoreError as e:
-                if re.search(r"not found|no such|does not exist|unknown object", str(e), re.I):
+                if re.search(spec.get("missing") or MISSING, str(e), re.I):
                     return None
                 raise
-            if spec.get("output") == "stdout":
-                return r.stdout.encode()
-            return f.read_bytes() if f.exists() else None
+            content = r.stdout.encode() if spec.get("output") == "stdout" else (
+                f.read_bytes() if f.exists() else b"")
+            if spec.get("missing") and re.search(spec["missing"], r.stdout + r.stderr, re.I):
+                return None
+            return content or None      # nothing came back: there's no such object
 
     def objects(self, otype: str | None = None, project: str | None = None) -> list[tuple[str, str]]:
         op = "project_list" if project else "list"
@@ -1900,6 +1909,21 @@ class Workspace:
         return done
 
 
+def portable(path: Path, root: Path, vscode: bool = False) -> str:
+    """A path for a file the team commits: relative inside the repo, ~ (or VS Code's ${userHome}) inside the
+    home folder, absolute otherwise. Everyone who installed the lore in the same place can use it as is."""
+    home = Path.home().resolve()
+    try:
+        return path.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        pass
+    try:
+        rest = path.relative_to(home).as_posix()
+        return ("${userHome}/" if vscode else "~/") + rest
+    except ValueError:
+        return str(path)
+
+
 def ws_init(root: Path, lore_path: Path, src: str = "src") -> Path:
     """A workspace in `root`: config (which lore, the site's variables and secrets to fill in), .gitignore lines
     for what's per developer, and VS Code tasks for the commands."""
@@ -1911,11 +1935,7 @@ def ws_init(root: Path, lore_path: Path, src: str = "src") -> Path:
     if (d / "config.json").exists():
         raise LoreError(f"{root} is already a workspace ({WS_DIR}/config.json)")
     d.mkdir(parents=True)
-    try:
-        rel = os.path.relpath(lore_path.resolve(), root.resolve())
-        lore_ref = rel if not rel.startswith("..") else str(lore_path.resolve())
-    except ValueError:
-        lore_ref = str(lore_path.resolve())
+    lore_ref = portable(lore_path.resolve(), root)
     cfg = {"lore": lore_ref, "root": src,
            "variables": {k: "" for k in (ops.get("variables") or {})},
            "secrets": {k: f"LORE_{k.upper()}" for k in (ops.get("secrets") or {})},
@@ -1930,7 +1950,8 @@ def ws_init(root: Path, lore_path: Path, src: str = "src") -> Path:
     tasks = root / ".vscode" / "tasks.json"
     if not tasks.exists():
         tasks.parent.mkdir(exist_ok=True)
-        lore_py = f"{Path(__file__).resolve()}"
+        beside = lore_path.resolve().parent / "lore.py"           # an installed skill: its own lore.py
+        lore_py = portable(beside if beside.exists() else Path(__file__).resolve(), root, vscode=True)
         mk = lambda label, args: {"label": label, "type": "process", "command": "python3",  # noqa: E731
                                   "args": [lore_py, "ws", *args], "problemMatcher": []}
         tasks.write_text(json.dumps({"version": "2.0.0", "tasks": [

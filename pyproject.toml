@@ -33,5 +33,5 @@ hobkin = "https://github.com/frank-lynam/hobkin"
 hobkin-lore = "hobkin_lore:cli"
 
 [tool.flit.sdist]
-include = ["tests/", "packs/"]
+include = ["tests/", "packs/", "docs/"]
 exclude = ["CLAUDE.md", "AGENTS.md"]
