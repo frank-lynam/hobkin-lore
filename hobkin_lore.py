@@ -37,6 +37,9 @@ Building a pack source from documentation (with any OpenAI-format model), and re
                                                 rests on; model answers recorded, so rebuilds are cheap
     hobkin-lore review DIR                      a local page: each entry beside its source; accept, edit, reject
 
+Code that lives in a database (a lore whose tools can pull and deploy it), worked from a git repo:
+    hobkin-lore ws init LORE | list | pull | status [--remote] | deploy FILE... | validate | compile | test
+
 Serving lores to any MCP client (VS Code, Cursor, Claude Desktop...), over stdio:
     hobkin-lore mcp [LORE...]                   (in an installed skill: python3 lore.py mcp)
 
@@ -76,6 +79,7 @@ from pathlib import Path
 #   install       the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
 #   build         any documentation -> a pack source, with a model: gather, chunk, distill, verify, finish
 #   review        a local web page to review a built pack source, entry by entry, beside the source it cites
+#   workspace     code that lives in a database, in a git repo: pull, status, deploy (conflict-checked), validate
 #   mcp           the lookups as an MCP server over stdio (VS Code, Cursor, Claude Desktop, any MCP client)
 #   command line  argument parsing, main
 
@@ -104,8 +108,55 @@ NOTES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, at TEXT, by TEXT, ref TEXT, text TEXT NOT NULL);
 """
 
-SOURCE_FILES = ("pack.json", "sections.jsonl", "symbols.jsonl", "tools.jsonl", "examples.jsonl",
+SOURCE_FILES = ("pack.json", "sections.jsonl", "symbols.jsonl", "tools.jsonl", "examples.jsonl", "operations.json",
                 "cheatsheet.md", "skill.md")
+
+
+OPERATIONS = {         # what the lore's operations.json may define; {placeholders} each one is given
+    "list": "the objects of a {type}, one per line of output (parsed with `parse`)",
+    "project_list": "the objects in a {project}, one per line of output (parsed with `parse`)",
+    "pull": "copies object {type} {name} from the database into {file} (or prints it: \"output\": \"stdout\")",
+    "deploy": "copies {file} into the database as object {type} {name}",
+    "validate": "checks {file} (object {type} {name}) without changing the database",
+    "compile": "compiles object {type} {name} in the database",
+    "build_project": "builds {project} in the database",
+    "export_project": "exports {project} into the folder {dir}",
+}
+OBJECT_KEYS = ("type", "name", "file", "dir", "project")
+
+
+def check_operations(ops: dict) -> list[str]:
+    """Problems with an operations.json: unknown operations, placeholders nothing will fill, parse patterns that
+    don't compile. (`build` and `compile` refuse a broken one; `review` shows what's wrong.)"""
+    problems = []
+    known = set(OBJECT_KEYS) | set((ops.get("variables") or {})) | set((ops.get("secrets") or {}))
+    for name, op in (ops.get("operations") or {}).items():
+        if name not in OPERATIONS:
+            problems.append(f"operation {name!r}: not one of {', '.join(OPERATIONS)}")
+            continue
+        if not isinstance(op, dict) or not str(op.get("command") or "").strip():
+            problems.append(f"operation {name!r}: needs a command")
+            continue
+        try:
+            words = shlex.split(op["command"])
+        except ValueError as e:
+            problems.append(f"operation {name!r}: {e}")
+            continue
+        for w in words:
+            for ph in re.findall(r"\{(\w+)\}", w):
+                if ph not in known:
+                    problems.append(f"operation {name!r}: {{{ph}}} isn't a variable, a secret or one of "
+                                    f"{', '.join(OBJECT_KEYS)}")
+        if op.get("parse"):
+            try:
+                rx = re.compile(op["parse"])
+                if "name" not in rx.groupindex:
+                    problems.append(f"operation {name!r}: parse needs a (?P<name>...) group")
+            except re.error as e:
+                problems.append(f"operation {name!r}: parse: {e}")
+    if (ops.get("operations") or {}).get("pull") is None and ops.get("operations"):
+        problems.append("no pull operation: nothing can come from the database")
+    return problems
 
 
 class LoreError(Exception):
@@ -140,7 +191,9 @@ def read_source(src: Path) -> dict:
          "sections": kept(read_jsonl(src / "sections.jsonl")), "symbols": kept(read_jsonl(src / "symbols.jsonl")),
          "tools": kept(read_jsonl(src / "tools.jsonl")), "examples": kept(read_jsonl(src / "examples.jsonl")),
          "cheatsheet": (src / "cheatsheet.md").read_text(encoding="utf-8") if (src / "cheatsheet.md").exists() else "",
-         "skill": (src / "skill.md").read_text(encoding="utf-8") if (src / "skill.md").exists() else ""}
+         "skill": (src / "skill.md").read_text(encoding="utf-8") if (src / "skill.md").exists() else "",
+         "operations": json.loads((src / "operations.json").read_text(encoding="utf-8"))
+         if (src / "operations.json").exists() else {}}
     errors, warnings = [], []
     ids = [s.get("id") for s in p["sections"]]
     for s in p["sections"]:
@@ -184,6 +237,7 @@ def read_source(src: Path) -> dict:
     for t in p["tools"]:
         if not t.get("name"):
             errors.append("a tool without a name")
+    errors += [f"operations.json: {e}" for e in check_operations(p["operations"])] if p["operations"] else []
     if errors:
         raise LoreError("the pack source has problems:\n  " + "\n  ".join(errors))
     p["warnings"] = warnings
@@ -260,6 +314,7 @@ def compile_pack(src: Path, out: Path, check: bool = True, log=print) -> dict:
             "version": pack.get("version", ""), "sources": json.dumps(pack.get("sources", [])),
             "check": json.dumps(pack.get("check")) if pack.get("check") else "",
             "cheatsheet": p["cheatsheet"], "skill": p["skill"], "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "operations": json.dumps(p["operations"]) if p["operations"] else "",
             "built_by": f"hobkin-lore {__version__}"}
     con.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
     for i, s in enumerate(p["sections"]):
@@ -665,6 +720,26 @@ def skill_md(meta: dict, has_tools: bool, has_examples: bool) -> str:
               "can check them.",
               f"{6 if has_tools else 5}. When the reference was wrong, missing or surprising, `note` it "
               "(with `--on NAME`), so the next lookup shows it.", ""]
+    ops = json.loads(meta.get("operations") or "{}")
+    if ops.get("operations"):
+        have = ", ".join(sorted(ops["operations"]))
+        lines += ["## Working with the code in the database", "",
+                  f"This lore can also run {meta['language']}'s tools for you (operations: {have}), on code that "
+                  "lives in a database, from a git repo laid out as `src/TYPE/NAME`. In such a repo (it has a "
+                  "`.lore-workspace/` folder):", "",
+                  "| Command | Does |", "| --- | --- |",
+                  "| `ws status [--remote]` | What changed here, and (with --remote) in the database since your pull |",
+                  "| `ws list --type T` / `--project P` | Objects in the database |",
+                  "| `ws pull TYPE NAME` / `--type T` / `--project P` / `--file F` | From the database into files "
+                  "(never over your unsaved work) |",
+                  "| `ws validate FILE` | Check a file with the tools, without changing the database |",
+                  "| `ws deploy FILE... [--compile]` | Into the (dev) database, after checking nobody deployed over it "
+                  "since your pull |",
+                  "| `ws test` | Try the operations safely (list, pull, validate) |", "",
+                  "Pull before you change something, validate before you deploy, and commit what you deploy. When "
+                  "deploy reports a CONFLICT (someone else deployed the same object since your pull), don't force "
+                  "it: tell the person you're working for, show them the three versions it saved, and merge with "
+                  "them. Deploy only to the database the workspace is set up for, never anywhere else.", ""]
     if meta.get("skill"):
         lines += ["## About this language", "", meta["skill"].rstrip(), ""]
     return "\n".join(lines)
@@ -1207,7 +1282,8 @@ def entry_key(kind: str, e: dict) -> str:
     return f"{e['name']}\t{e.get('kind', '')}" if kind in ("symbols", "tools") else e.get("id", "")
 
 
-def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: str, skill: str, log=print) -> None:
+def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: str, skill: str, log=print,
+               ops: dict | None = None) -> None:
     """The pack source, keeping a reviewer's decisions: an entry accepted, edited or rejected before stays as
     the reviewer left it; everything else is the new build."""
     out.mkdir(parents=True, exist_ok=True)
@@ -1230,7 +1306,10 @@ def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: 
     (out / "pack.json").write_text(json.dumps(pack, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     work = out / ".build"
     work.mkdir(parents=True, exist_ok=True)
-    for fname, text in (("cheatsheet.md", cheatsheet), ("skill.md", skill)):
+    texts = [("cheatsheet.md", cheatsheet), ("skill.md", skill)]
+    if ops:
+        texts.append(("operations.json", json.dumps(ops, indent=2, ensure_ascii=False)))
+    for fname, text in texts:
         # replaced only if nobody changed it since the last build wrote it
         last, cur = work / f"generated-{fname}", out / fname
         if not cur.exists() or (last.exists() and cur.read_text(encoding="utf-8") == last.read_text(encoding="utf-8")):
@@ -1240,6 +1319,46 @@ def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: 
         last.write_text(text.strip() + "\n", encoding="utf-8")
     if kept:
         log(f"kept {kept} entries a reviewer had accepted, edited or rejected")
+
+
+OPERATIONS_SYSTEM = """You set up how a team works on code that lives in a database, through its command-line
+tools. From the tools' documentation and the scripts that use them, write the command template for each operation
+the tools can do. Reply with only a JSON object:
+{"variables": {"name": "what it is (e.g. the database name, the operator id)"},
+ "secrets": {"name": "what it is (e.g. the database password)"},
+ "layout": {"ext": {"OBJECTTYPE": ".ext", "*": ".txt"}},
+ "operations": {"OPERATION": {"command": "tool --flag {placeholder} ...", "output": "file" or "stdout",
+                              "parse": "a regex for one line of list output, with (?P<name>...) and maybe (?P<type>...)",
+                              "notes": "anything a person setting it up should check"}}}
+
+Operations (leave out any the tools can't do):
+""" + "\n".join(f"- {k}: {v}" for k, v in OPERATIONS.items()) + """
+
+A command is one tool invocation, words separated by spaces, no shell (no pipes, no redirection, no &&). Use
+{placeholders} for the object ({type}, {name}, {file}, {dir}, {project}) and for every site-specific value
+(database, server, user) as a variable, and every password as a secret: never a real value. Use only flags the
+documentation shows."""
+
+
+def draft_operations(model: Model, language: str, packs: dict, log=print) -> dict:
+    """[operations] The model drafts operations.json from the tool entries and script examples; plain code
+    checks it. A draft that doesn't hold together is kept with its problems noted, for review."""
+    tools = "\n\n".join(f"## {t['name']}\n{t.get('purpose') or ''}\nusage: {t.get('usage') or ''}\n"
+                         f"{t.get('body') or ''}\n" + "\n".join(f"  {f.get('flag')}  {f.get('meaning')}"
+                                                               for f in t.get("flags") or [])
+                         for t in packs["tools"])
+    used = "\n".join(f"- {e['code'][:300]}  ({e.get('notes') or ''})" for e in packs["examples"]
+                     if any(t["name"] in e["code"] for t in packs["tools"]))[:20000]
+    ops = model.ask("operations", OPERATIONS_SYSTEM, f"Language: {language}\n\nTools:\n{tools[:40000]}\n\n"
+                                                     f"How the scripts use them:\n{used or '(none)'}")
+    ops = {k: v for k, v in ops.items() if k in ("variables", "secrets", "layout", "operations")}
+    problems = check_operations(ops)
+    if problems:
+        ops["problems"] = problems
+        log("operations drafted, with problems to fix in review: " + "; ".join(problems))
+    else:
+        log(f"operations drafted: {', '.join(sorted(ops.get('operations') or {}))} (review them before use)")
+    return ops
 
 
 def build(name: str, sources: list[str], tools: list[str], out: Path, model: Model, title: str | None = None,
@@ -1260,12 +1379,15 @@ def build(name: str, sources: list[str], tools: list[str], out: Path, model: Mod
     heads = "\n".join(f"- {s['title']}" for s in packs["sections"][:200])
     fin = model.ask("finish", FINISH_SYSTEM, f"Language: {language}\n\nSections:\n{heads}\n\nSymbols:\n{names}"
                                              f"\n\nTools:\n{tool_lines or '(none documented)'}")
+    ops = {}
+    if packs["tools"]:
+        ops = draft_operations(model, language, packs, log)
     pack = {"name": name, "title": title, "language": language, "version": version or "",
             "description": fin.get("description") or f"The {language} reference.",
             "sources": [s["name"] for s in srcs]}
     if check:
         pack["check"] = check
-    write_pack(out, pack, packs, str(fin.get("cheatsheet") or ""), str(fin.get("skill") or ""), log)
+    write_pack(out, pack, packs, str(fin.get("cheatsheet") or ""), str(fin.get("skill") or ""), log, ops)
     flagged = sum(1 for rows in packs.values() for r in rows if (r.get("review") or {}).get("flags"))
     return {"out": str(out), "sources": len(srcs), "chunks": len(json.loads((work / "chunks.json").read_text())),
             **{k: len(v) for k, v in packs.items()}, "flagged": flagged, "model_calls": model.calls}
@@ -1382,9 +1504,16 @@ class Review:
         return {"state": state, "output": output}
 
     def text(self, name: str, value: str | None = None) -> str:
-        if name not in ("cheatsheet.md", "skill.md"):
-            raise LoreError("only cheatsheet.md and skill.md")
+        if name not in ("cheatsheet.md", "skill.md", "operations.json"):
+            raise LoreError("only cheatsheet.md, skill.md and operations.json")
         f = self.src / name
+        if value is not None and name == "operations.json":
+            try:
+                problems = check_operations(json.loads(value))
+            except json.JSONDecodeError as e:
+                raise LoreError(f"not JSON: {e}") from None
+            if problems:
+                raise LoreError("; ".join(problems))
         if value is not None:
             f.write_text(value, encoding="utf-8")
         return f.read_text(encoding="utf-8") if f.exists() else ""
@@ -1438,7 +1567,7 @@ async function loadSummary() {
   $("counts").textContent = `${u} unreviewed, ${f} flagged`;
 }
 async function loadList() {
-  if (kind === "texts") { $("list").innerHTML = ["cheatsheet.md","skill.md"].map((n) => `<div class="item" data-n="${n}"><div class="t">${n}</div></div>`).join("");
+  if (kind === "texts") { $("list").innerHTML = ["cheatsheet.md","skill.md","operations.json"].map((n) => `<div class="item" data-n="${n}"><div class="t">${n}</div></div>`).join("");
     $("list").querySelectorAll(".item").forEach((d) => d.onclick = () => openText(d.dataset.n)); return; }
   const rows = await api(`/api/list?kind=${kind}&status=${encodeURIComponent($("status").value)}&q=${encodeURIComponent($("q").value)}`);
   $("list").innerHTML = rows.map((r) => `<div class="item${current===r.key?" sel":""}" data-k="${esc(r.key)}"><div class="t">${esc(r.title)}<span class="chip ${r.status}">${r.status}</span>${r.flags.length?'<span class="chip flag">flag</span>':""}</div><div class="l">${esc(r.line)}</div></div>`).join("") || '<p class="muted">nothing here</p>';
@@ -1540,6 +1669,313 @@ def review_server(src: Path, host: str = "127.0.0.1", port: int = 8765):
     srv = ThreadingHTTPServer((host, port), H)
     srv.token = token
     return srv
+
+
+# ---- workspace: code that lives in a database, worked from a git repo through the lore's tools
+
+WS_DIR = ".lore-workspace"
+class Workspace:
+    """A git repo (or any folder) holding code that lives in a database: files laid out as ROOT/TYPE/NAME.EXT,
+    worked through the lore's operations. `.lore-workspace/config.json` says which lore and the site's
+    variables; the manifest records what each file was pulled from (a hash, and a copy of it), so a deploy can
+    tell when the database changed since."""
+
+    def __init__(self, start: Path | None = None):
+        d = (start or Path.cwd()).resolve()
+        while not (d / WS_DIR / "config.json").exists():
+            if d.parent == d:
+                raise LoreError("not in a workspace (no .lore-workspace/config.json here or above): "
+                                "lore.py ws init")
+            d = d.parent
+        self.root = d
+        self.cfg = json.loads((d / WS_DIR / "config.json").read_text(encoding="utf-8"))
+        lore_path = Path(self.cfg["lore"]).expanduser()
+        if not lore_path.is_absolute():
+            lore_path = (d / lore_path).resolve()
+        self.lore = Lore(lore_path)
+        self.ops = json.loads(self.lore.meta.get("operations") or "{}")
+        for k, v in (self.cfg.get("operations") or {}).items():      # site overrides, without a rebuild
+            self.ops.setdefault("operations", {})[k] = v
+        problems = check_operations(self.ops)
+        if problems:
+            raise LoreError("the operations don't hold together:\n  " + "\n  ".join(problems))
+        self.src = d / self.cfg.get("root", "src")
+        self.mpath = d / WS_DIR / "manifest.json"
+        self.manifest = json.loads(self.mpath.read_text()) if self.mpath.exists() else {}
+
+    # --- running an operation
+    def secrets(self) -> dict:
+        out = {}
+        for key, env in (self.cfg.get("secrets") or {}).items():
+            if env and os.environ.get(env):
+                out[key] = os.environ[env]
+        return out
+
+    def mask(self, text: str) -> str:
+        for v in self.secrets().values():
+            if v:
+                text = text.replace(v, "*****")
+        return text
+
+    def argv(self, op: str, **kw) -> list[str]:
+        """An operation's command, filled in: split into words first, so a value is always exactly one word."""
+        spec = (self.ops.get("operations") or {}).get(op)
+        if not spec:
+            raise LoreError(f"this lore has no {op!r} operation ({OPERATIONS.get(op, '')})")
+        values = {**{k: str(v) for k, v in (self.cfg.get("variables") or {}).items()}, **self.secrets(),
+                  **{k: str(v) for k, v in kw.items()}}
+        argv = []
+        for word in shlex.split(spec["command"]):    # split first, fill in after: a value can't add words
+            missing = [ph for ph in re.findall(r"\{(\w+)\}", word) if ph not in values]
+            if missing:
+                raise LoreError(f"{op}: no value for {', '.join('{' + m + '}' for m in missing)} (set it under "
+                                f"variables or secrets in {WS_DIR}/config.json)")
+            argv.append(re.sub(r"\{(\w+)\}", lambda m: values[m.group(1)], word))
+        return argv
+
+    def run(self, op: str, **kw) -> subprocess.CompletedProcess:
+        argv = self.argv(op, **kw)
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=self.root,
+                               timeout=float(self.cfg.get("timeout", 600)))
+        except FileNotFoundError:
+            raise LoreError(f"{op}: {argv[0]} isn't installed (or isn't on PATH)") from None
+        except subprocess.TimeoutExpired:
+            raise LoreError(f"{op}: timed out") from None
+        if r.returncode != 0:
+            raise LoreError(f"{op} failed (exit {r.returncode}): {self.mask((r.stderr or r.stdout).strip())[:2000]}")
+        return r
+
+    # --- objects and files
+    def ext(self, otype: str) -> str:
+        exts = (self.ops.get("layout") or {}).get("ext") or {}
+        return exts.get(otype, exts.get("*", ".txt"))
+
+    def path_for(self, otype: str, name: str) -> Path:
+        if not re.fullmatch(r"[\w.$#@ -]+", otype) or ".." in name.split("/") or name.startswith("/"):
+            raise LoreError(f"can't make a path from {otype!r} {name!r}")
+        return self.src / otype / (name + self.ext(otype))
+
+    def object_of(self, path: Path) -> tuple[str, str]:
+        rel = path.resolve().relative_to(self.src.resolve())
+        otype, rest = rel.parts[0], "/".join(rel.parts[1:])
+        ext = self.ext(otype)
+        return otype, rest[: -len(ext)] if ext and rest.endswith(ext) else rest
+
+    def key(self, path: Path) -> str:
+        return path.resolve().relative_to(self.root).as_posix()
+
+    def fetch(self, otype: str, name: str) -> bytes | None:
+        """The database's copy of an object (None if it isn't there)."""
+        spec = self.ops["operations"]["pull"]
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / ("object" + self.ext(otype))
+            try:
+                r = self.run("pull", type=otype, name=name, file=f, dir=tmp)
+            except LoreError as e:
+                if re.search(r"not found|no such|does not exist|unknown object", str(e), re.I):
+                    return None
+                raise
+            if spec.get("output") == "stdout":
+                return r.stdout.encode()
+            return f.read_bytes() if f.exists() else None
+
+    def objects(self, otype: str | None = None, project: str | None = None) -> list[tuple[str, str]]:
+        op = "project_list" if project else "list"
+        spec = (self.ops.get("operations") or {}).get(op) or {}
+        r = self.run(op, type=otype or "", project=project or "")
+        rx = re.compile(spec.get("parse") or r"^(?P<name>\S+)")
+        out = []
+        for line in r.stdout.splitlines():
+            m = rx.search(line)
+            if m and m.group("name"):
+                out.append((m.groupdict().get("type") or otype or "", m.group("name").strip()))
+        return out
+
+    def save_manifest(self):
+        self.mpath.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.mpath.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.manifest, indent=1, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, self.mpath)
+
+    def record_base(self, path: Path, otype: str, name: str, content: bytes):
+        base = self.root / WS_DIR / "base" / self.key(path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(content)
+        self.manifest[self.key(path)] = {"type": otype, "name": name, "hash": hashlib.sha256(content).hexdigest(),
+                                         "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+    # --- the commands
+    def pull(self, objs: list[tuple[str, str]], force: bool = False, log=print) -> dict:
+        """Objects from the database into their files. A file changed here since its last pull is left alone
+        (unless --force), so a pull never loses work."""
+        done = {"pulled": 0, "same": 0, "kept": 0, "missing": 0}
+        for otype, name in objs:
+            path = self.path_for(otype, name)
+            content = self.fetch(otype, name)
+            if content is None:
+                done["missing"] += 1
+                log(f"  {otype} {name}: not in the database")
+                continue
+            m = self.manifest.get(self.key(path))
+            if path.exists() and not force:
+                here = hashlib.sha256(path.read_bytes()).hexdigest()
+                if m is None or here != m["hash"]:
+                    if here != hashlib.sha256(content).hexdigest():
+                        done["kept"] += 1
+                        log(f"  {self.key(path)}: changed here, not overwritten (deploy it, or pull --force)")
+                        continue
+            same = path.exists() and path.read_bytes() == content
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            self.record_base(path, otype, name, content)
+            done["same" if same else "pulled"] += 1
+        self.save_manifest()
+        return done
+
+    def status(self, remote: bool = False) -> list[tuple[str, str]]:
+        """Each file: same, changed here, changed in the database (with remote), both (a conflict), new here, or
+        gone here."""
+        out = []
+        tracked = set(self.manifest)
+        for k, m in sorted(self.manifest.items()):
+            path = self.root / k
+            here = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+            local = "gone here" if here is None else ("changed here" if here != m["hash"] else "")
+            db = ""
+            if remote:
+                cur = self.fetch(m["type"], m["name"])
+                if cur is None:
+                    db = "gone from the database"
+                elif hashlib.sha256(cur).hexdigest() != m["hash"]:
+                    db = "changed in the database"
+            state = "CONFLICT: " + " and ".join(x for x in (local, db) if x) if local and db else (local or db or "same")
+            out.append((k, state))
+        if self.src.exists():
+            for f in sorted(self.src.rglob("*")):
+                if f.is_file() and self.key(f) not in tracked:
+                    out.append((self.key(f), "new here (never pulled)"))
+        return out
+
+    def deploy(self, files: list[Path], force: bool = False, validate: bool = True, compile_: bool = False,
+               log=print) -> dict:
+        """Files into the database. Before writing, the database's copy is compared with what was pulled: if
+        someone deployed over it since, this stops, and leaves base, theirs and yours side by side for a merge by
+        hand (then deploy --force). Nothing is ever overwritten without that check or --force."""
+        done = {"deployed": 0, "conflicts": 0}
+        has = (self.ops.get("operations") or {})
+        for f in files:
+            path = f.resolve()
+            otype, name = self.object_of(path)
+            k, mine = self.key(path), path.read_bytes()
+            if validate and "validate" in has:
+                self.run("validate", type=otype, name=name, file=path, dir=path.parent)
+            if not force:
+                cur = self.fetch(otype, name)
+                m = self.manifest.get(k)
+                base_hash = m["hash"] if m else None
+                cur_hash = hashlib.sha256(cur).hexdigest() if cur is not None else None
+                if cur_hash != base_hash and cur_hash != hashlib.sha256(mine).hexdigest():
+                    cdir = self.root / WS_DIR / "conflicts" / k
+                    cdir.mkdir(parents=True, exist_ok=True)
+                    base = self.root / WS_DIR / "base" / k
+                    (cdir / "base").write_bytes(base.read_bytes() if base.exists() else b"")
+                    (cdir / "theirs").write_bytes(cur or b"")
+                    (cdir / "mine").write_bytes(mine)
+                    done["conflicts"] += 1
+                    who = "isn't in the database any more" if cur is None else (
+                        "was deployed by someone else since your pull" if m else "already exists in the database")
+                    log(f"  CONFLICT {k}: it {who}. Not deployed.\n"
+                        f"    merge by hand: code --merge {cdir}/mine {cdir}/theirs {cdir}/base {k}\n"
+                        f"    (or: git merge-file {k} {cdir}/base {cdir}/theirs), then: lore.py ws deploy {k} --force")
+                    continue
+            self.run("deploy", type=otype, name=name, file=path, dir=path.parent)
+            if compile_ and "compile" in has:
+                self.run("compile", type=otype, name=name, file=path, dir=path.parent)
+            self.record_base(path, otype, name, mine)
+            shutil.rmtree(self.root / WS_DIR / "conflicts" / k, ignore_errors=True)
+            done["deployed"] += 1
+            log(f"  {k}: deployed")
+        self.save_manifest()
+        return done
+
+
+def ws_init(root: Path, lore_path: Path, src: str = "src") -> Path:
+    """A workspace in `root`: config (which lore, the site's variables and secrets to fill in), .gitignore lines
+    for what's per developer, and VS Code tasks for the commands."""
+    lore = Lore(lore_path)
+    ops = json.loads(lore.meta.get("operations") or "{}")
+    if not ops.get("operations"):
+        raise LoreError(f"{lore_path.name} has no operations (its pack source needs operations.json)")
+    d = root / WS_DIR
+    if (d / "config.json").exists():
+        raise LoreError(f"{root} is already a workspace ({WS_DIR}/config.json)")
+    d.mkdir(parents=True)
+    try:
+        rel = os.path.relpath(lore_path.resolve(), root.resolve())
+        lore_ref = rel if not rel.startswith("..") else str(lore_path.resolve())
+    except ValueError:
+        lore_ref = str(lore_path.resolve())
+    cfg = {"lore": lore_ref, "root": src,
+           "variables": {k: "" for k in (ops.get("variables") or {})},
+           "secrets": {k: f"LORE_{k.upper()}" for k in (ops.get("secrets") or {})},
+           "operations": {}, "timeout": 600}
+    (d / "config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    gi = root / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    for want in (f"{WS_DIR}/base/", f"{WS_DIR}/conflicts/", f"{WS_DIR}/manifest.json"):
+        if want not in lines:
+            lines.append(want)
+    gi.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tasks = root / ".vscode" / "tasks.json"
+    if not tasks.exists():
+        tasks.parent.mkdir(exist_ok=True)
+        lore_py = f"{Path(__file__).resolve()}"
+        mk = lambda label, args: {"label": label, "type": "process", "command": "python3",  # noqa: E731
+                                  "args": [lore_py, "ws", *args], "problemMatcher": []}
+        tasks.write_text(json.dumps({"version": "2.0.0", "tasks": [
+            mk("lore: status", ["status"]), mk("lore: status (against the database)", ["status", "--remote"]),
+            mk("lore: pull this file", ["pull", "--file", "${file}"]),
+            mk("lore: validate this file", ["validate", "${file}"]),
+            mk("lore: deploy this file", ["deploy", "${file}"]),
+            mk("lore: deploy this file (after merging a conflict)", ["deploy", "${file}", "--force"]),
+        ]}, indent=2) + "\n", encoding="utf-8")
+    return d / "config.json"
+
+
+def ws_test(ws: Workspace, otype: str | None, log=print) -> bool:
+    """Each operation tried safely: list (or a project's), then one object pulled to a temporary file and
+    validated. Nothing is deployed or changed."""
+    ok = True
+    types = [otype] if otype else [t for t in ((ws.ops.get("layout") or {}).get("ext") or {}) if t != "*"][:1] or [""]
+    try:
+        objs = ws.objects(types[0])
+        log(f"list {types[0]}: {len(objs)} objects" + (f", e.g. {objs[0][0]} {objs[0][1]}" if objs else ""))
+    except LoreError as e:
+        log(f"list: FAILED: {e}")
+        return False
+    if not objs:
+        log("nothing listed: give --type of a kind of object the database has")
+        return False
+    t, n = objs[0]
+    try:
+        content = ws.fetch(t or types[0], n)
+        log(f"pull {t} {n}: {'ok, ' + str(len(content)) + ' bytes' if content else 'FAILED: nothing came back'}")
+        ok = ok and bool(content)
+    except LoreError as e:
+        log(f"pull: FAILED: {e}")
+        return False
+    if "validate" in ws.ops["operations"] and content:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / ("object" + ws.ext(t or types[0]))
+            f.write_bytes(content)
+            try:
+                ws.run("validate", type=t or types[0], name=n, file=f, dir=tmp)
+                log("validate: ok (the object as it is in the database)")
+            except LoreError as e:
+                log(f"validate: FAILED: {e}")
+                ok = False
+    return ok
 
 
 # ---- mcp: the lookups as an MCP server (stdio), for VS Code, Cursor, Claude Desktop and any other MCP client
@@ -1721,6 +2157,35 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("src", help="the pack source folder")
     r.add_argument("--port", type=int, default=8765)
     r.add_argument("--host", default="127.0.0.1")
+    w = sub.add_parser("ws", aliases=["workspace"],
+                       help="code that lives in a database, in a git repo: pull, status, deploy, validate")
+    wsub = w.add_subparsers(dest="ws_cmd")
+    wi = wsub.add_parser("init", help="make this folder a workspace for a lore that has operations")
+    wi.add_argument("lore_file", nargs="?", metavar="LORE", help="the .lore.db (default: --lore, $LORE, or the "
+                    "one beside lore.py)")
+    wi.add_argument("--root", default="src", help="the folder the objects go in (default: src)")
+    wl = wsub.add_parser("list", help="objects in the database")
+    wl.add_argument("--type")
+    wl.add_argument("--project")
+    wp = wsub.add_parser("pull", help="objects from the database into files")
+    wp.add_argument("object", nargs="*", metavar="TYPE NAME")
+    wp.add_argument("--type", help="every object of this type")
+    wp.add_argument("--project", help="every object in this project")
+    wp.add_argument("--file", action="append", default=[], help="the object this file holds (repeatable)")
+    wp.add_argument("--force", action="store_true", help="overwrite files changed here")
+    wst = wsub.add_parser("status", help="what changed here (and, with --remote, in the database)")
+    wst.add_argument("--remote", action="store_true", help="also compare with the database (one pull per object)")
+    wd = wsub.add_parser("deploy", help="files into the database, after a conflict check")
+    wd.add_argument("files", nargs="+", metavar="FILE")
+    wd.add_argument("--force", action="store_true", help="skip the conflict check (after merging by hand)")
+    wd.add_argument("--no-validate", action="store_true", help="don't validate first")
+    wd.add_argument("--compile", action="store_true", help="compile each object after deploying it")
+    wv = wsub.add_parser("validate", help="check files with the tools, without changing the database")
+    wv.add_argument("files", nargs="+", metavar="FILE")
+    wc = wsub.add_parser("compile", help="compile objects in the database")
+    wc.add_argument("files", nargs="+", metavar="FILE")
+    wt = wsub.add_parser("test", help="try the operations safely: list, pull one object, validate it")
+    wt.add_argument("--type")
     m = sub.add_parser("mcp", help="serve lores as an MCP server over stdio (for VS Code, Cursor, Claude Desktop...)")
     m.add_argument("lores", nargs="*", metavar="LORE", help="the .lore.db files (default: --lore, $LORE, or the one "
                    "beside lore.py)")
@@ -1734,6 +2199,58 @@ def parser() -> argparse.ArgumentParser:
     ns = sub.add_parser("notes", help="what's been noted")
     ns.add_argument("query", nargs="*")
     return ap
+
+
+def cmd_ws(args) -> int:
+    if args.ws_cmd == "init":
+        cfg = ws_init(Path.cwd(), Path(args.lore_file).expanduser() if args.lore_file else find_lore(args.lore),
+                      args.root)
+        c = json.loads(cfg.read_text())
+        print(f"workspace set up: {cfg}")
+        if c["variables"]:
+            print(f"  fill in the variables there: {', '.join(c['variables'])}")
+        if c["secrets"]:
+            print("  and set the secrets as environment variables: "
+                  + ", ".join(f"{v} ({k})" for k, v in c["secrets"].items()))
+        print("  then: lore.py ws test")
+        return 0
+    ws = Workspace()
+    if args.ws_cmd == "list":
+        for t, n in ws.objects(args.type, args.project):
+            print(f"{t} {n}".strip())
+        return 0
+    if args.ws_cmd == "pull":
+        objs = []
+        if len(args.object) % 2:
+            raise LoreError("pull TYPE NAME [TYPE NAME...]")
+        objs += list(zip(args.object[::2], args.object[1::2]))
+        objs += [ws.object_of(Path(f)) for f in args.file]
+        if args.type or args.project:
+            objs += ws.objects(args.type, args.project)
+        if not objs:
+            raise LoreError("pull what? TYPE NAME, --type T, --project P or --file F")
+        r = ws.pull(objs, force=args.force)
+        print(f"pulled {r['pulled']}, unchanged {r['same']}, kept (changed here) {r['kept']}, "
+              f"missing {r['missing']}")
+        return 0
+    if args.ws_cmd == "status":
+        rows = [(k, st) for k, st in ws.status(args.remote) if st != "same"]
+        print("\n".join(f"{st:<40} {k}" for k, st in rows) or "everything is as pulled")
+        return 1 if any(st.startswith("CONFLICT") for _, st in rows) else 0
+    if args.ws_cmd == "deploy":
+        r = ws.deploy([Path(f) for f in args.files], force=args.force, validate=not args.no_validate,
+                      compile_=args.compile)
+        print(f"deployed {r['deployed']}" + (f", {r['conflicts']} CONFLICTS (not deployed)" if r["conflicts"] else ""))
+        return 1 if r["conflicts"] else 0
+    if args.ws_cmd in ("validate", "compile"):
+        for f in args.files:
+            t, n = ws.object_of(Path(f))
+            r = ws.run(args.ws_cmd, type=t, name=n, file=Path(f).resolve(), dir=Path(f).resolve().parent)
+            print(f"{f}: ok" + (f"\n{ws.mask(r.stdout.strip())}" if r.stdout.strip() else ""))
+        return 0
+    if args.ws_cmd == "test":
+        return 0 if ws_test(ws, args.type) else 1
+    raise LoreError("ws what? init, list, pull, status, deploy, validate, compile, test")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1779,6 +2296,8 @@ def main(argv: list[str] | None = None) -> int:
             except KeyboardInterrupt:
                 pass
             return 0
+        if args.cmd in ("ws", "workspace"):
+            return cmd_ws(args)
         if args.cmd == "mcp":
             paths = [Path(p).expanduser() for p in args.lores] or [find_lore(args.lore)]
             lores = {}

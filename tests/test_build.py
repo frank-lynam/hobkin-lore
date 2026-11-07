@@ -129,6 +129,9 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(syms["invented"]["review"]["flags"], ["quote not found in the source"])
         tools = hl.read_jsonl(self.out / "tools.jsonl")
         self.assertEqual(tools[0]["name"], "toyrun")
+        ops = json.loads((self.out / "operations.json").read_text())       # drafted from the tool, and sound
+        self.assertNotIn("problems", ops)
+        self.assertEqual(sorted(ops["operations"]), ["list", "pull"])
         pack = json.loads((self.out / "pack.json").read_text())
         self.assertEqual(pack["description"], "Toylang, a tiny language for tests.")
         self.assertIn("double quotes", (self.out / "cheatsheet.md").read_text())

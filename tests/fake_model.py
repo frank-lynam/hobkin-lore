@@ -13,6 +13,12 @@ def answer(system: str, user: str) -> dict:
         # the help's "Commands:" lines, as help invocations; and, to prove they're refused, two that do work
         names = re.findall(r"^  ([a-z]+)  ", user, re.M)
         return {"invocations": [[n, "--help"] for n in names] + [["work", "PROJECTX"], ["--delete-everything"]]}
+    if "code that lives in a database" in system:
+        return {"variables": {"db": "the database"}, "secrets": {"password": "the database password"},
+                "layout": {"ext": {"*": ".txt"}},
+                "operations": {"list": {"command": "toyrun list --type {type} --db {db}",
+                                        "parse": "^(?P<type>\\S+) (?P<name>\\S+)$"},
+                               "pull": {"command": "toyrun work {name} --out {file}", "output": "file"}}}
     if "two short texts" in system:
         return {"description": "Toylang, a tiny language for tests.", "cheatsheet": "- strings use double quotes",
                 "skill": "Run code with toyrun."}

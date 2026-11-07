@@ -176,6 +176,56 @@ and unreviewed entries come first. Accept, reject, or edit and save: the pack so
 place, and `compile` leaves rejected entries out. Examples can be run through the pack's check command, and
 the cheatsheet and skill text edited, from the same page.
 
+## Code that lives in a database: the workspace
+
+Some languages keep their code in a database, not in files: PeopleCode, Oracle Forms and many vendor platforms
+are edited through their own tools and saved straight into tables. When a lore's tools can list, pull and deploy
+that code, the lore can carry **operations** too, and the same `lore.py` works the code from a git repo, so
+developers (and Claude Code, in VS Code) work in files with history, review and branches, while the database
+stays where the code runs.
+
+**The operations** are in the pack source's `operations.json`: a command template for each thing the tools can
+do, with `{placeholders}`.
+
+```json
+{"variables": {"db": "the database to work in"},
+ "secrets": {"password": "the database password"},
+ "layout": {"ext": {"PeopleCode": ".pcode", "SQL": ".sql", "*": ".txt"}},
+ "operations": {
+   "list":     {"command": "pscli list -db {db} -type {type}", "parse": "^(?P<type>\\S+) (?P<name>\\S+)$"},
+   "pull":     {"command": "pscli export -db {db} -type {type} -name {name} -out {file}"},
+   "deploy":   {"command": "pscli import -db {db} -type {type} -name {name} -in {file} -pw {password}"},
+   "validate": {"command": "pscli validate -in {file}"}}}
+```
+
+Operations: `list` and `project_list` (output parsed line by line with `parse`), `pull`, `deploy`, `validate`,
+`compile`, `build_project`, `export_project`. `build` drafts them from the tool documentation and scripts it
+learned, flagged for review; the review page edits them (and refuses one that doesn't hold together); `compile`
+checks them again. Every command is one program and its words, no shell: it's split into words before values
+are filled in, so a value is always exactly one word.
+
+**A workspace** is a repo set up for a lore with operations:
+
+```sh
+cd my-peoplesoft-repo
+python3 ~/.claude/skills/pscli-lore/lore.py ws init    # config, .gitignore lines, VS Code tasks
+# fill in .lore-workspace/config.json's variables (db...); export LORE_PASSWORD=... (secrets: env only)
+lore.py ws test                                         # list, pull one object, validate it: nothing changes
+lore.py ws pull --project HR_FIX                        # into src/TYPE/NAME.ext
+lore.py ws status --remote                              # changed here, in the database, or both
+lore.py ws validate src/PeopleCode/JOB.EMPLID.FieldChange.pcode
+lore.py ws deploy src/PeopleCode/JOB.EMPLID.FieldChange.pcode --compile
+```
+
+- **A pull never loses work:** a file changed here since its last pull is left alone (`--force` to overwrite).
+- **A deploy never overwrites someone else's:** it compares the database's copy with what you pulled first.
+  If someone deployed over it since, it stops and saves the base, theirs and yours side by side, with the
+  command to open a three-way merge in VS Code (`code --merge ...`). Merge by hand, then `deploy --force`.
+- **Secrets** come only from environment variables (the config names them), and are masked in every message.
+- **Site differences** go in the config's `operations`, which override the lore's without a rebuild.
+- **The skill knows:** a lore with operations adds a section to its `SKILL.md` saying how to pull, validate and
+  deploy, and to bring a conflict to a person rather than force it.
+
 ## Tests
 
 ```sh
