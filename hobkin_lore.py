@@ -755,6 +755,86 @@ def html_text(raw: str) -> str:
     return p.text()
 
 
+SCRIPT_EXTS = (".sh", ".bash", ".ksh", ".zsh", ".dms", ".dat", ".sql", ".ps1", ".bat", ".cmd", ".py", ".pl",
+               ".pc", ".pcode", ".mak", ".cfg", ".ini", ".log", ".transcript")
+HELP_FLAGS = ("--help", "-h", "-help", "-H", "-?", "help", "/?")   # tools of every era: GNU, Oracle, Windows
+HELP_LIMIT = 60          # help pages read per tool, subcommands included
+SUBCOMMANDS_SYSTEM = """You read a command-line tool's help text and list the commands that print the help of
+its subcommands, modes or topics, so all of the tool's options can be documented. Only commands that print help
+and do nothing else: never one that lists, exports, builds, connects or changes anything. Use the help flag this
+tool uses. Reply with only a JSON object: {"invocations": [["subcommand", "--help"], ["help", "topic"], ...]}
+(the arguments after the tool's name; an empty list when it has no subcommands)."""
+
+
+def safe_help(args: list) -> bool:
+    """Whether an invocation only asks for help: words for subcommands, then a help flag (or `help WORD...`).
+    Plain code decides, not the model: a wrong suggestion can never run an operation."""
+    if not args or not all(isinstance(a, str) for a in args) or len(args) > 4:
+        return False
+    word = re.compile(r"[A-Za-z][\w.-]{0,40}")
+    if args[0] == "help":
+        return all(word.fullmatch(a) for a in args[1:])
+    return args[-1] in HELP_FLAGS and all(word.fullmatch(a) for a in args[:-1])
+
+
+def run_help(argv: list[str]) -> str:
+    """A help page: never with stdin (a tool waiting for a login just gets end-of-file), never for long."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return ""
+    except OSError as e:
+        raise LoreError(f"tool {argv[0]!r}: {e}") from None
+    return plain(r.stdout + r.stderr)
+
+
+def looks_like_help(text: str) -> bool:
+    return bool(text.strip()) and (re.search(r"usage|options|synopsis|commands|flags|parameters", text, re.I)
+                                   is not None or len(text.strip().splitlines()) >= 4)
+
+
+def tool_help(cmd: str, model, log=print, limit: int = HELP_LIMIT) -> list[str]:
+    """A tool's help: the first of the usual help flags that gives some, then (with a model) its subcommands'
+    help, two levels down, at most HELP_LIMIT pages. Only help is ever run."""
+    base = shlex.split(cmd)
+    pages, flag = [], None
+    for f in HELP_FLAGS:
+        text = run_help(base + [f])
+        if looks_like_help(text):
+            pages.append((f, [f], text))
+            flag = f
+            break
+    if not pages:
+        log(f"  {cmd}: no help from any of {' '.join(HELP_FLAGS)}")
+        return []
+    if model is not None:
+        seen, queue = {tuple(pages[0][1])}, [(pages[0][1], pages[0][2], 0)]
+        while queue and len(pages) < limit:
+            args, text, depth = queue.pop(0)
+            if depth >= 2:
+                continue
+            ask = model.ask("subcommands", SUBCOMMANDS_SYSTEM,
+                            f"Tool: {cmd}\nIts help flag: {flag}\nHelp printed by: {cmd} {' '.join(args)}\n\n"
+                            f"{text[:CHUNK_CHARS]}")
+            for inv in ask.get("invocations") or []:
+                if not isinstance(inv, list):
+                    continue
+                inv = [str(a) for a in inv]
+                if tuple(inv) in seen or len(pages) >= limit:
+                    continue
+                seen.add(tuple(inv))
+                if not safe_help(inv):
+                    log(f"  {cmd}: not running {' '.join(inv)!r} (not a help request)")
+                    continue
+                sub = run_help(base + inv)
+                if looks_like_help(sub) and sub.strip() != text.strip():
+                    pages.append((" ".join(inv), inv, sub))
+                    queue.append((inv, sub, depth + 1))
+        if len(pages) > 1:
+            log(f"  {cmd}: {len(pages)} help pages (subcommands found)")
+    return [f"# {cmd} {label}\n\n{text}" for label, _, text in pages]
+
+
 def plain(text: str) -> str:
     """Terminal output as plain text: no colour or bold codes (man still emits them), no overstrike."""
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|.\x08", "", text)
@@ -764,9 +844,11 @@ def slug(text: str, n: int = 48) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n] or "x"
 
 
-def gather(sources: list[str], tools: list[str], work: Path, log=print) -> list[dict]:
-    """Every source as text in work/sources/, listed in work/sources.json: files (PDF, HTML, Markdown, text),
-    folders of them, URLs, and for each tool its --help and man page."""
+def gather(sources: list[str], tools: list[str], work: Path, log=print, model: Model | None = None,
+           help_limit: int = HELP_LIMIT) -> list[dict]:
+    """Every source as text in work/sources/, listed in work/sources.json: files (PDF, HTML, Markdown, text,
+    scripts), folders of them, URLs, and for each tool its help (its subcommands' too, found with the model) and
+    man page."""
     out_dir = work / "sources"
     out_dir.mkdir(parents=True, exist_ok=True)
     listed: list[dict] = []
@@ -791,6 +873,9 @@ def gather(sources: list[str], tools: list[str], work: Path, log=print) -> list[
             keep(path.name, "html", html_text(path.read_text(encoding="utf-8", errors="replace")))
         elif ext in (".md", ".txt", ".rst", ".adoc", "") or ext.startswith(".man"):
             keep(path.name, "text", path.read_text(encoding="utf-8", errors="replace"))
+        elif ext in SCRIPT_EXTS:           # how the tools are really used: flags, sequences, idioms
+            keep(path.name, "script", f"# Script {path.name}, as it is used\n\n```\n"
+                 + path.read_text(encoding="utf-8", errors="replace") + "\n```\n")
 
     for src in sources:
         if re.match(r"https?://", src):
@@ -810,17 +895,10 @@ def gather(sources: list[str], tools: list[str], work: Path, log=print) -> list[
             raise LoreError(f"no such source: {src}")
     for cmd in tools:
         name = shlex.split(cmd)[0]
-        parts = []
-        for args in (["--help"], ["-h"]):
-            try:
-                r = subprocess.run(shlex.split(cmd) + args, capture_output=True, text=True, timeout=30)
-            except (OSError, subprocess.TimeoutExpired) as e:
-                raise LoreError(f"tool {cmd!r}: {e}") from None
-            if (r.stdout + r.stderr).strip():
-                parts.append(f"# {cmd} {' '.join(args)}\n\n" + plain(r.stdout + r.stderr))
-                break
+        parts = tool_help(cmd, model, log, help_limit)
         if shutil.which("man"):
             r = subprocess.run(["man", "-P", "cat", name], capture_output=True, text=True, timeout=30,
+                               stdin=subprocess.DEVNULL,
                                env={**os.environ, "MANWIDTH": "100", "MAN_KEEP_FORMATTING": "0",
                                     "GROFF_NO_SGR": "1"})
             if r.returncode == 0 and r.stdout.strip():
@@ -927,6 +1005,9 @@ edge cases), none of the prose. Include only what this passage documents; leave 
 
 An example's "code" is only the program text in the language, exactly as it would be saved in a file: never
 the shell command that runs it (no `tool '...'` wrapper, no prompt); put such a command in "notes".
+
+A passage may be a tool's help text or a script that uses the tools: from help, document each tool and every
+flag; from scripts, take real usage as examples (with "notes" saying what it does) and as evidence for flags.
 
 Every entry needs "quote": a short passage (5 to 30 words) copied exactly, character for character, from the
 passage, that supports the entry; one stretch of text, without "..." in it. Entries whose quote isn't in the
@@ -1163,13 +1244,13 @@ def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: 
 
 def build(name: str, sources: list[str], tools: list[str], out: Path, model: Model, title: str | None = None,
           language: str | None = None, version: str | None = None, check: dict | None = None, jobs: int = 4,
-          limit: int | None = None, log=print) -> dict:
+          limit: int | None = None, log=print, help_limit: int = HELP_LIMIT) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name):
         raise LoreError("the name: lowercase letters, digits and hyphens (it names the skill)")
     work = out / ".build"
     title, language = title or name, language or title or name
     log("gathering sources...")
-    srcs = gather(sources, tools, work, log)
+    srcs = gather(sources, tools, work, log, model, help_limit)
     if not srcs:
         raise LoreError("no text in any of the sources")
     entries = distill_all(model, srcs, work, language, jobs, limit, log)
@@ -1616,7 +1697,8 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("name", help="the lore's name (lowercase, hyphens): it names the skill, NAME-lore")
     b.add_argument("sources", nargs="*", help="PDF, HTML, Markdown or text files, folders of them, or URLs")
     b.add_argument("--tool", action="append", default=[], metavar="CMD",
-                   help="a command-line tool of the language: its --help and man page are read (repeatable)")
+                   help="a command-line tool of the language: its help (every subcommand's, found by the model; "
+                        "only help is ever run) and man page are read (repeatable)")
     b.add_argument("--out", help="the pack source folder to write (default: packs/NAME)")
     b.add_argument("--title")
     b.add_argument("--language", help="the language's name, if it isn't the title")
@@ -1632,6 +1714,8 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--key-env", default="LORE_API_KEY", help="the variable holding the API key (default: "
                    "LORE_API_KEY; none needed for a local endpoint)")
     b.add_argument("--jobs", type=int, default=4, help="chunks read at once (default 4)")
+    b.add_argument("--help-limit", type=int, default=HELP_LIMIT,
+                   help=f"help pages read per tool, subcommands included (default {HELP_LIMIT})")
     b.add_argument("--limit", type=int, help="only the first N chunks (to try a build cheaply)")
     r = sub.add_parser("review", help="review a built pack source in the browser")
     r.add_argument("src", help="the pack source folder")
@@ -1681,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
             check = {"command": args.check, "ext": args.check_ext,
                      "compare": args.check_compare} if args.check else None
             r = build(args.name, args.sources, args.tool, out, model, args.title, args.language, args.lang_version,
-                      check, args.jobs, args.limit)
+                      check, args.jobs, args.limit, help_limit=args.help_limit)
             print(f"{r['out']}: {r['sources']} sources, {r['chunks']} chunks -> {r['sections']} sections, "
                   f"{r['symbols']} symbols, {r['examples']} examples, {r['tools']} tools; {r['flagged']} flagged "
                   f"for review; {r['model_calls']} model calls (the rest were recorded)"

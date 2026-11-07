@@ -28,8 +28,14 @@ DOC = """<html><body><nav>skip me</nav>
 </body></html>"""
 
 TOOL = """#!/bin/sh
-echo "usage: toyrun FILE [-v]"
-echo "  -v   say what it does"
+case "$1 $2" in
+  "work --help") echo "usage: toyrun work PROJECT [--out DIR]"; echo "  --out DIR   where the export goes" ;;
+  "list --help") echo "usage: toyrun list [--type T]"; echo "  --type T   only objects of type T" ;;
+  "work "*|"list "*) touch "$(dirname "$0")/DID_WORK"; echo "working" ;;
+  "--help "*|"-h "*) echo "usage: toyrun FILE [-v]"; echo "  -v   say what it does"; echo "Commands:";
+                     echo "  work  export a project"; echo "  list  list objects" ;;
+  *) touch "$(dirname "$0")/DID_WORK"; echo "working" ;;
+esac
 """
 
 
@@ -52,6 +58,27 @@ class BuildTest(unittest.TestCase):
         model = hl.Model(self.fake.url, "fake", None, self.out / ".build" / "answers")
         return hl.build("toy", [str(self.tmp / "doc.html")], [self.tool], self.out, model, title="Toylang",
                         log=lambda *_: None), model
+
+    def test_a_tools_help_is_found_subcommands_too_and_nothing_else_runs(self):
+        pages = hl.tool_help(self.tool, hl.Model(self.fake.url, "fake", None, self.tmp / "answers"),
+                             log=lambda *_: None)
+        text = "\n".join(pages)
+        self.assertIn("usage: toyrun FILE", text)
+        self.assertIn("--out DIR", text)                         # a subcommand's help, found through the model
+        self.assertIn("--type T", text)
+        self.assertFalse((self.tmp / "DID_WORK").exists())       # the model's "work PROJECTX" was never run
+        self.assertFalse(hl.safe_help(["work", "PROJECTX"]))
+        self.assertFalse(hl.safe_help(["--delete-everything"]))
+        self.assertFalse(hl.safe_help(["export", "/tmp/x", "--help"]))
+        self.assertTrue(hl.safe_help(["export", "--help"]))
+        self.assertTrue(hl.safe_help(["help", "export"]))
+        self.assertTrue(hl.safe_help(["-?"]))
+
+    def test_scripts_are_sources(self):
+        (self.tmp / "nightly.sh").write_text("toyrun work PAYROLL --out /tmp/x\n")
+        srcs = hl.gather([str(self.tmp / "nightly.sh")], [], self.tmp / "work", log=lambda *_: None)
+        self.assertEqual(srcs[0]["kind"], "script")
+        self.assertIn("toyrun work PAYROLL", (self.tmp / "work" / "sources" / f"{srcs[0]['id']}.txt").read_text())
 
     def test_html_text_keeps_structure(self):
         t = hl.html_text(DOC)

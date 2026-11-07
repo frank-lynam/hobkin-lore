@@ -139,8 +139,16 @@ hobkin-lore compile packs/jq         # then compile and install as usual
 ```
 
 1. **Gather.** PDFs (with `pdftotext`), HTML (files, folders or URLs; navigation and scripts dropped,
-   headings and code kept), Markdown and text, and for each `--tool`, its `--help` and man page. Each becomes
-   a numbered text source in `packs/NAME/.build/sources/`.
+   headings and code kept), Markdown and text, scripts that use the tools (`.sh`, `.dms`, `.sql`, `.ps1`,
+   `.bat`, logs and captured terminal sessions: how a team really uses them), and for each `--tool`, its help
+   and man page. Each becomes a numbered text source in `packs/NAME/.build/sources/`.
+
+   **Tools nobody outside your network has seen.** `--tool` tries the help flags of every era (`--help`, `-h`,
+   `-help`, `-H`, `-?`, `help`, `/?`), then has the model read that help and propose the help pages of its
+   subcommands, two levels down (`--help-limit`, default 60 pages). Plain code runs a proposal only if it asks
+   for help (subcommand words, then a help flag, or `help WORD`), so a build never lists, exports, connects or
+   changes anything, whatever the model suggests. Tools always run with no stdin, so one waiting for a login
+   just gets end-of-file.
 2. **Chunk** at headings into pieces a model reads whole.
 3. **Distill.** Each chunk goes to the model, which writes sections, symbols, examples and tools in its own
    words, each with a short quote from the passage it rests on (`--jobs` at a time).

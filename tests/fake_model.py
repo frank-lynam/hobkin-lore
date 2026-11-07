@@ -9,6 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 def answer(system: str, user: str) -> dict:
+    if "list the commands that print the help" in system:
+        # the help's "Commands:" lines, as help invocations; and, to prove they're refused, two that do work
+        names = re.findall(r"^  ([a-z]+)  ", user, re.M)
+        return {"invocations": [[n, "--help"] for n in names] + [["work", "PROJECTX"], ["--delete-everything"]]}
     if "two short texts" in system:
         return {"description": "Toylang, a tiny language for tests.", "cheatsheet": "- strings use double quotes",
                 "skill": "Run code with toyrun."}
