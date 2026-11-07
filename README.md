@@ -29,6 +29,8 @@ hobkin-lore install jq.lore.db --project .    # for one project's Claude Code (.
 hobkin-lore install jq.lore.db --to DIR       # any skills folder
 ```
 
+For VS Code's Copilot, Cursor or Claude Desktop, see [MCP](#in-vs-code-cursor-claude-desktop-and-other-mcp-clients) below.
+
 The agent sees the skill's one-line description in its list of skills and opens it when a task touches the
 language. From then on it looks things up:
 
@@ -57,6 +59,43 @@ examples: map-select (Keep some elements), group-count (Count per group)  ->  ex
 
 Every output is short and paged: a lookup can't flood an agent's context. Outside a skill folder, point it at a
 lore with `--lore FILE` or `LORE=FILE`.
+
+## In VS Code, Cursor, Claude Desktop and other MCP clients
+
+Claude Code (in the terminal or in VS Code) and hobkin use the skill folder directly. For any other AI tool
+that speaks [MCP](https://modelcontextprotocol.io), a lore is also an MCP server over stdio: the same lookups
+as tools (`cheatsheet`, `search`, `symbol`, `toc`, `show`, `examples`, `tools`, `tool`, `note`, `info`). An
+installed skill's own `lore.py` serves it, so the editor needs nothing installed:
+
+```sh
+python3 ~/.claude/skills/jq-lore/lore.py mcp          # its own lore
+hobkin-lore mcp jq.lore.db peoplecode.lore.db          # several: each tool then takes `lore`
+```
+
+VS Code (`.vscode/mcp.json` in a workspace, or **MCP: Open User Configuration**):
+
+```json
+{
+  "servers": {
+    "jq-lore": {"type": "stdio", "command": "python3", "args": ["/home/you/.claude/skills/jq-lore/lore.py", "mcp"]}
+  }
+}
+```
+
+Cursor (`.cursor/mcp.json`) and Claude Desktop (`claude_desktop_config.json`) take the same command under
+`mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "jq-lore": {"command": "python3", "args": ["/home/you/.claude/skills/jq-lore/lore.py", "mcp"]}
+  }
+}
+```
+
+The server tells the model how to use it (read the cheatsheet once, look up what it isn't sure of), and stdout
+carries nothing but the protocol. Notes an agent makes through MCP land in the same notes file as everyone
+else's.
 
 ## Make a lore: the pack source
 

@@ -176,6 +176,73 @@ class LoreTest(unittest.TestCase):
         finally:
             del os.environ["HOBKIN_HOME"]
 
+    # --- mcp
+    def mcp(self, *messages, args=()):
+        """Talk to `hobkin-lore mcp` over stdio: the replies, by id."""
+        lines = "".join(json.dumps({"jsonrpc": "2.0", **m}) + "\n" for m in messages)
+        r = subprocess.run([sys.executable, str(ROOT / "hobkin_lore.py"), "mcp", *(args or [str(self.lore)])],
+                           input=lines, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = [json.loads(l) for l in r.stdout.splitlines()]          # stdout holds nothing but JSON-RPC
+        return {m["id"]: m for m in out}
+
+    def test_mcp_handshake_tools_and_calls(self):
+        init = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}
+        got = self.mcp({"id": 1, "method": "initialize", "params": init},
+                       {"method": "notifications/initialized"},
+                       {"id": 2, "method": "tools/list"},
+                       {"id": 3, "method": "tools/call", "params": {"name": "symbol", "arguments": {"name": "select"}}},
+                       {"id": 4, "method": "tools/call", "params": {"name": "symbol", "arguments": {"name": "slect"}}},
+                       {"id": 5, "method": "tools/call", "params": {"name": "search",
+                                                                     "arguments": {"query": "group", "limit": 3}}},
+                       {"id": 6, "method": "ping"}, {"id": 7, "method": "nope"})
+        r = got[1]["result"]
+        self.assertEqual((r["protocolVersion"], r["serverInfo"]["name"]), ("2025-06-18", "jq-lore"))
+        self.assertIn("tools", r["capabilities"])
+        names = [t["name"] for t in got[2]["result"]["tools"]]
+        self.assertEqual(names, ["cheatsheet", "search", "symbol", "toc", "show", "examples", "tools", "tool",
+                                 "note", "info"])
+        for t in got[2]["result"]["tools"]:
+            self.assertEqual(t["inputSchema"]["type"], "object")
+            self.assertTrue(t["description"])
+        self.assertFalse(got[3]["result"]["isError"])
+        self.assertIn("select(f)", got[3]["result"]["content"][0]["text"])
+        self.assertTrue(got[4]["result"]["isError"])                    # a tool error, not a protocol error
+        self.assertIn("did you mean: select", got[4]["result"]["content"][0]["text"])
+        self.assertIn("group_by", got[5]["result"]["content"][0]["text"])
+        self.assertEqual(got[6]["result"], {})
+        self.assertEqual(got[7]["error"]["code"], -32601)
+        self.assertEqual(len(got), 7)                                   # the notification got no reply
+
+    def test_mcp_an_unknown_protocol_version_gets_ours(self):
+        got = self.mcp({"id": 1, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}})
+        self.assertEqual(got[1]["result"]["protocolVersion"], hl.MCP_VERSIONS[0])
+
+    def test_mcp_several_lores_take_a_lore_argument(self):
+        other_src = self.tmp / "jq2"
+        shutil.copytree(JQ, other_src)
+        pack = json.loads((other_src / "pack.json").read_text())
+        pack["name"], pack["title"] = "jqtwo", "jq two"
+        (other_src / "pack.json").write_text(json.dumps(pack))
+        hl.compile_pack(other_src, self.tmp / "jqtwo.lore.db", check=False, log=lambda *_: None)
+        got = self.mcp({"id": 1, "method": "tools/list"},
+                       {"id": 2, "method": "tools/call", "params": {"name": "info", "arguments": {"lore": "jqtwo"}}},
+                       {"id": 3, "method": "tools/call", "params": {"name": "info", "arguments": {}}},
+                       args=[str(self.lore), str(self.tmp / "jqtwo.lore.db")])
+        search = next(t for t in got[1]["result"]["tools"] if t["name"] == "search")
+        self.assertEqual(search["inputSchema"]["properties"]["lore"]["enum"], ["jq", "jqtwo"])
+        self.assertIn("lore", search["inputSchema"]["required"])
+        self.assertIn("jq two", got[2]["result"]["content"][0]["text"])
+        self.assertTrue(got[3]["result"]["isError"])
+
+    def test_mcp_from_an_installed_skill(self):
+        skills = self.tmp / "skills-mcp"
+        hl.install(self.lore, skills)
+        r = subprocess.run([sys.executable, str(skills / "jq-lore" / "lore.py"), "mcp"], capture_output=True,
+                           text=True, timeout=60, input=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                                                    "method": "tools/list"}) + "\n")
+        self.assertIn('"name": "symbol"', r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

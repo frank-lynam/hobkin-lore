@@ -30,6 +30,9 @@ with --lore FILE or $LORE):
     note TEXT [--on REF]    keep something learned the hard way (kept apart from the lore; survives rebuilds)
     notes [QUERY]           what's been noted
 
+Serving lores to any MCP client (VS Code, Cursor, Claude Desktop...), over stdio:
+    hobkin-lore mcp [LORE...]                   (in an installed skill: python3 lore.py mcp)
+
 Standard library only; Python 3.9+. See README.md for the pack source format.
 """
 
@@ -57,6 +60,7 @@ from pathlib import Path
 #   lookup        the commands an agent uses: info, cheatsheet, toc, search, symbol, show, examples, tools, tool
 #   notes         what agents learn, in a notes file beside the lore (never inside it)
 #   install       the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
+#   mcp           the lookups as an MCP server over stdio (VS Code, Cursor, Claude Desktop, any MCP client)
 #   command line  argument parsing, main
 
 
@@ -648,6 +652,115 @@ def install(lore_path: Path, base: Path) -> Path:
     return folder
 
 
+# ---- mcp: the lookups as an MCP server (stdio), for VS Code, Cursor, Claude Desktop and any other MCP client
+
+MCP_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")    # newest first; we answer in the client's if we know it
+
+
+def mcp_tools(lores: dict[str, Lore]) -> list[dict]:
+    """The tools: the lookup commands, each described for a model that hasn't opened the skill. With several
+    lores, each tool takes `lore` (one of their names)."""
+    names = list(lores)
+    langs = ", ".join(lores[n].meta["language"] for n in names)
+    which = {"lore": {"type": "string", "enum": names, "description": "Which reference: " + ", ".join(
+        f"{n} ({lores[n].meta['title']})" for n in names)}} if len(names) > 1 else {}
+    s = lambda props=None, required=(): {"type": "object", "properties": {**which, **(props or {})},  # noqa: E731
+                                         "required": (["lore"] if which else []) + list(required)}
+    text = lambda d: {"type": "string", "description": d}  # noqa: E731
+    num = lambda d: {"type": "integer", "description": d}  # noqa: E731
+    tools = [
+        ("cheatsheet", f"The essentials of {langs}: read once at the start of a task, before writing code.", s()),
+        ("search", f"Search the {langs} reference: sections, symbols, tools, examples and notes, ranked, with "
+                   "snippets. A word that is exactly a symbol's name puts that symbol first.",
+         s({"query": text("words to look for, e.g. a function name or what you want to do"),
+            "kind": {"type": "string", "enum": ["section", "symbol", "tool", "example", "note"],
+                     "description": "only this kind of entry"},
+            "limit": num("how many hits (default 8)")}, ["query"])),
+        ("symbol", f"One {langs} function, class, keyword, operator...: signature, behaviour, see-also, examples "
+                   "and notes. Look up anything you aren't certain of before using it.",
+         s({"name": text("its exact name; a near miss suggests the right one")}, ["name"])),
+        ("toc", "The reference's outline, or one branch of it (section ids in brackets).",
+         s({"id": text("a section id, for its branch")})),
+        ("show", "One section of the reference, a page at a time.",
+         s({"id": text("the section id"), "from": num("the line to start at, for the next page")}, ["id"])),
+        ("examples", "Worked examples, each marked whether the language's own tool ran it as shown.",
+         s({"query": text("words to look for"), "symbol": text("examples that use this symbol"),
+            "id": text("one example by id")})),
+        ("tools", f"The command-line tools that come with {langs}.", s()),
+        ("tool", "One command-line tool: purpose, usage, flags and real runs with their output.",
+         s({"name": text("the tool's name")}, ["name"])),
+        ("note", "Keep something learned the hard way (the reference was wrong, missing or surprising), so the "
+                 "next lookup shows it.",
+         s({"text": text("what you learned"), "on": text("the symbol, section or tool it's about")}, ["text"])),
+        ("info", "What this reference covers, its counts and where it came from.", s()),
+    ]
+    return [{"name": n, "description": d, "inputSchema": sch} for n, d, sch in tools]
+
+
+def mcp_call(lores: dict[str, Lore], name: str, a: dict) -> str:
+    """Run one tool: the same code as the command line, so both always agree."""
+    lore = lores[a["lore"]] if len(lores) > 1 else next(iter(lores.values()))
+    words = lambda v: str(v).split() if v else []  # noqa: E731
+    ns = {"cheatsheet": {}, "info": {}, "tools": {},
+          "search": {"query": words(a.get("query")), "kind": a.get("kind"), "n": int(a.get("limit") or 8)},
+          "symbol": {"name": a.get("name", "")},
+          "toc": {"id": a.get("id")},
+          "show": {"id": a.get("id", ""), "from_": int(a.get("from") or 0)},
+          "examples": {"query": words(a.get("query")), "symbol": a.get("symbol"), "id": a.get("id"), "n": 5},
+          "tool": {"name": a.get("name", ""), "from_": int(a.get("from") or 0)},
+          "note": {"text": words(a.get("text")), "on": a.get("on")}}
+    if name not in ns:
+        raise LoreError(f"no tool {name!r}")
+    return LOOKUPS[name](lore, argparse.Namespace(**ns[name]))
+
+
+def mcp_serve(lores: dict[str, Lore], stdin=None, stdout=None) -> None:
+    """MCP over stdio: one JSON-RPC message per line in, one per line out. Nothing else goes to stdout."""
+    stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+    tools = mcp_tools(lores)
+    first = next(iter(lores.values())).meta
+    title = " + ".join(lo.meta["title"] for lo in lores.values())
+
+    def send(msg):
+        stdout.write(json.dumps({"jsonrpc": "2.0", **msg}, ensure_ascii=False) + "\n")
+        stdout.flush()
+
+    for line in stdin:
+        if not line.strip():
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            send({"id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if mid is None:                          # a notification (initialized, cancelled...): nothing to answer
+            continue
+        if method == "initialize":
+            asked = params.get("protocolVersion")
+            send({"id": mid, "result": {
+                "protocolVersion": asked if asked in MCP_VERSIONS else MCP_VERSIONS[0],
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": f"{first['name']}-lore" if len(lores) == 1 else "hobkin-lore",
+                               "title": f"{title} reference", "version": __version__},
+                "instructions": (f"A searchable reference for {title}. Before writing or fixing code in it, read "
+                                 "cheatsheet once, then look up each function, keyword or tool you aren't certain "
+                                 "of (symbol, or search when you don't know the name). Prefer checked examples "
+                                 "to guesses, and note what the reference got wrong.")}})
+        elif method == "ping":
+            send({"id": mid, "result": {}})
+        elif method == "tools/list":
+            send({"id": mid, "result": {"tools": tools}})
+        elif method == "tools/call":
+            try:
+                text, err = mcp_call(lores, params.get("name", ""), params.get("arguments") or {}), False
+            except (LoreError, KeyError, ValueError) as e:
+                text, err = str(e) if not isinstance(e, KeyError) else f"which lore? {e} isn't one", True
+            send({"id": mid, "result": {"content": [{"type": "text", "text": text}], "isError": err}})
+        else:
+            send({"id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}})
+
+
 # ---- command line: argument parsing, main
 
 LOOKUPS = {"info": cmd_info, "cheatsheet": cmd_cheatsheet, "toc": cmd_toc, "search": cmd_search,
@@ -690,6 +803,9 @@ def parser() -> argparse.ArgumentParser:
     e.add_argument("--symbol")
     e.add_argument("--id")
     e.add_argument("-n", type=int, default=5)
+    m = sub.add_parser("mcp", help="serve lores as an MCP server over stdio (for VS Code, Cursor, Claude Desktop...)")
+    m.add_argument("lores", nargs="*", metavar="LORE", help="the .lore.db files (default: --lore, $LORE, or the one "
+                   "beside lore.py)")
     sub.add_parser("tools", help="the command-line tools")
     tl = sub.add_parser("tool", help="one tool")
     tl.add_argument("name")
@@ -718,7 +834,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "install":
             folder = install(Path(args.lore_file), install_dir(args))
             print(f"installed: {folder}\n  SKILL.md, lore.py, {Path(args.lore_file).name}"
-                  f"\n  try: python3 {folder / 'lore.py'} info")
+                  f"\n  try: python3 {folder / 'lore.py'} info"
+                  f"\n  as an MCP server (VS Code, Cursor, Claude Desktop): python3 {folder / 'lore.py'} mcp")
+            return 0
+        if args.cmd == "mcp":
+            paths = [Path(p).expanduser() for p in args.lores] or [find_lore(args.lore)]
+            lores = {}
+            for p in paths:
+                lo = Lore(p)
+                if lo.meta["name"] in lores:
+                    raise LoreError(f"two lores named {lo.meta['name']!r}")
+                lores[lo.meta["name"]] = lo
+            mcp_serve(lores)
             return 0
         if args.cmd in LOOKUPS:
             print(LOOKUPS[args.cmd](Lore(find_lore(args.lore)), args))
