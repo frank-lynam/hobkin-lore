@@ -1,0 +1,5 @@
+__pycache__/
+*.lore.db
+*.notes.db
+*.building
+dist/

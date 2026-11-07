@@ -1,0 +1,9 @@
+{
+  "name": "jq",
+  "title": "jq",
+  "language": "jq",
+  "version": "1.7",
+  "description": "jq, the command-line JSON processor: its filter language (paths, pipes, construction, built-in functions) and the jq command. A small hand-written sample lore for hobkin-lore, in its own words.",
+  "sources": ["jq 1.7 manual (https://jqlang.org/manual/v1.7/), summarized", "jq --help and runs of jq 1.7"],
+  "check": {"command": "jq -c -f {file}", "ext": ".jq"}
+}

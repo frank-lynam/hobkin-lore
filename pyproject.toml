@@ -1,0 +1,37 @@
+[build-system]
+requires = ["flit_core>=3.12,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "hobkin-lore"
+description = "Reference packs for languages and their tools, that an agent looks things up in instead of holding them in context: one SQLite file each, installed as a skill for hobkin or Claude Code."
+dynamic = ["version"]   # from hobkin_lore.__version__
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Frank Lynam" }]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["agent", "llm", "ai", "skills", "claude-code", "hobkin", "reference", "documentation", "rag", "sqlite"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/frank-lynam/hobkin-lore"
+Issues = "https://github.com/frank-lynam/hobkin-lore/issues"
+hobkin = "https://github.com/frank-lynam/hobkin"
+
+[project.scripts]
+hobkin-lore = "hobkin_lore:cli"
+
+[tool.flit.sdist]
+include = ["tests/", "packs/"]
+exclude = ["CLAUDE.md", "AGENTS.md"]

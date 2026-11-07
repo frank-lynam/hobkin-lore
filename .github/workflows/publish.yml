@@ -1,0 +1,98 @@
+# Tests on every push; publishing uses PyPI Trusted Publishing (no tokens stored):
+#   - publishing a GitHub release (tag vX.Y.Z, matching __version__) uploads to PyPI
+#   - running this workflow by hand (Actions -> Publish -> Run workflow) uploads to TestPyPI
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false    # one version failing shouldn't hide what the others say
+      matrix:
+        include:
+          # 3.9 is the oldest Python hobkin-lore supports (RHEL 9's); ubuntu-latest (26.04) no longer has it
+          - {python: "3.9", os: ubuntu-24.04}
+          - {python: "3.12", os: ubuntu-latest}
+          - {python: "3.14", os: ubuntu-latest}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -v tests 2>&1 | tee test-output.txt || {
+            # The step log needs a GitHub login; annotations are public. On a failure, every failing line (FAIL,
+            # FAILED, ERROR, ...Error:), then the end of the output, go in one. (The step runs under bash -e: grep
+            # finding nothing mustn't end it.)
+            { grep -E '^(FAIL|ERROR)|Error:' test-output.txt | head -n 30 || true; echo ...; tail -n 40 test-output.txt; } | python3 -c "import sys; t = sys.stdin.read(); print('::error title=Tests failed::' + t.replace('%', '%25').replace(chr(13), '%0D').replace(chr(10), '%0A'))"
+            exit 1
+          }
+
+  build:
+    needs: test
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the release tag matches __version__
+        if: github.event_name == 'release'
+        run: |
+          version=$(python -c 'import hobkin_lore; print(hobkin_lore.__version__)')
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} doesn't match hobkin_lore.__version__ $version"; exit 1
+          fi
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hobkin-lore
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/hobkin-lore
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
