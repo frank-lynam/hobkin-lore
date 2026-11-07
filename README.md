@@ -124,13 +124,49 @@ this, for instance where the tool isn't installed.
 **One schema at a time.** A lore records its schema version, and `lore.py` refuses a lore of another version
 with "rebuild it": lores are built artifacts, rebuilt from their source, never converted.
 
-## Next: building lores from any documentation
+## Build a lore from any documentation
 
 Hand-writing a pack is fine for a small language; a real one (PeopleCode, a vendor's DSL) has thousands of
-pages. Next comes `hobkin-lore build`: gather the sources (PDF, HTML, man pages, each tool's `--help` and real
-runs of it), have an LLM distill them into a pack source, every entry citing the source passage it came from,
-check those citations and the examples, and record every model answer so a rebuild is reproducible and free.
-The pack source it writes is the same format as above, so a person can review and fix it before compiling.
+pages. `hobkin-lore build` has a model write the pack source from the documentation itself:
+
+```sh
+export LORE_API_KEY=...            # any OpenAI-format endpoint: OpenRouter, a gateway, Ollama, vLLM...
+hobkin-lore build jq https://jqlang.org/manual/v1.7/ --tool jq --version 1.7 \
+    --check 'jq -c -f {file}' --check-ext .jq --check-compare json \
+    --base-url https://openrouter.ai/api/v1 --model nvidia/nemotron-3-ultra-550b-a55b
+hobkin-lore review packs/jq          # check what it made, in the browser
+hobkin-lore compile packs/jq         # then compile and install as usual
+```
+
+1. **Gather.** PDFs (with `pdftotext`), HTML (files, folders or URLs; navigation and scripts dropped,
+   headings and code kept), Markdown and text, and for each `--tool`, its `--help` and man page. Each becomes
+   a numbered text source in `packs/NAME/.build/sources/`.
+2. **Chunk** at headings into pieces a model reads whole.
+3. **Distill.** Each chunk goes to the model, which writes sections, symbols, examples and tools in its own
+   words, each with a short quote from the passage it rests on (`--jobs` at a time).
+4. **Verify,** in plain code: each quote is looked up in its chunk (whitespace, case, Markdown marks and a
+   shortening "..." aside). Found, it becomes a citation (`manual, lines 1843-1844`); not found, the entry is
+   flagged for review. Duplicates (a manual and its man page) are merged, and an example is tied only to the
+   symbols its code really uses.
+5. **Finish.** The model writes the description, the cheatsheet and the skill text from the merged entries.
+
+Every model answer is recorded in `.build/answers/`, keyed by the prompt and model: a rebuild asks again only
+about what changed. A reviewer's decisions outlive a rebuild: entries accepted, edited or rejected stay as the
+reviewer left them, and a hand-edited cheatsheet or skill text is kept. `--limit N` tries a build on the first
+N chunks. With `--check`, `compile` runs the examples; `--check-compare json` compares their output as JSON
+values (spacing aside), `words` ignoring spacing, `exact` (the default) as text.
+
+For a sense of scale: built from jq's online manual and its man page, with Nemotron 3 Ultra, it made 236
+sections, 178 symbols and 280 examples (252 of them run as documented) in 23 chunks, for under a dollar, with
+48 entries flagged for review. `packs/jq` is the hand-written comparison: 40 symbols, 12 examples.
+
+## Review
+
+`hobkin-lore review packs/NAME` serves a page on `127.0.0.1:8765` (local only, and changes need a token
+embedded in the page). Each entry is shown beside the source lines it cites, its quote highlighted; flagged
+and unreviewed entries come first. Accept, reject, or edit and save: the pack source's JSONL is updated in
+place, and `compile` leaves rejected entries out. Examples can be run through the pack's check command, and
+the cheatsheet and skill text edited, from the same page.
 
 ## Tests
 

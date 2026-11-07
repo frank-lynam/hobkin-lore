@@ -30,6 +30,13 @@ with --lore FILE or $LORE):
     note TEXT [--on REF]    keep something learned the hard way (kept apart from the lore; survives rebuilds)
     notes [QUERY]           what's been noted
 
+Building a pack source from documentation (with any OpenAI-format model), and reviewing it:
+    hobkin-lore build NAME [DOCS...] [--tool CMD]... --base-url URL --model M [--check CMD]
+                                                PDF, HTML, Markdown, folders, URLs, tools' --help and man
+                                                pages -> packs/NAME, every entry citing the source lines it
+                                                rests on; model answers recorded, so rebuilds are cheap
+    hobkin-lore review DIR                      a local page: each entry beside its source; accept, edit, reject
+
 Serving lores to any MCP client (VS Code, Cursor, Claude Desktop...), over stdio:
     hobkin-lore mcp [LORE...]                   (in an installed skill: python3 lore.py mcp)
 
@@ -42,16 +49,23 @@ __version__ = "0.1.0"
 
 import argparse
 import difflib
+import hashlib
+import html.parser
 import json
 import os
 import re
+import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # ---- map: `grep -n '^# ----' hobkin_lore.py` lists these sections.
@@ -60,6 +74,8 @@ from pathlib import Path
 #   lookup        the commands an agent uses: info, cheatsheet, toc, search, symbol, show, examples, tools, tool
 #   notes         what agents learn, in a notes file beside the lore (never inside it)
 #   install       the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
+#   build         any documentation -> a pack source, with a model: gather, chunk, distill, verify, finish
+#   review        a local web page to review a built pack source, entry by entry, beside the source it cites
 #   mcp           the lookups as an MCP server over stdio (VS Code, Cursor, Claude Desktop, any MCP client)
 #   command line  argument parsing, main
 
@@ -119,9 +135,10 @@ def read_source(src: Path) -> dict:
             raise LoreError(f"pack.json needs {key!r}")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", pack["name"]):
         raise LoreError("pack.json name: lowercase letters, digits and hyphens (it names the skill)")
-    p = {"pack": pack,
-         "sections": read_jsonl(src / "sections.jsonl"), "symbols": read_jsonl(src / "symbols.jsonl"),
-         "tools": read_jsonl(src / "tools.jsonl"), "examples": read_jsonl(src / "examples.jsonl"),
+    kept = lambda rows: [r for r in rows if (r.get("review") or {}).get("status") != "rejected"]  # noqa: E731
+    p = {"pack": pack,       # what a reviewer rejected (hobkin-lore review) stays in the source, out of the lore
+         "sections": kept(read_jsonl(src / "sections.jsonl")), "symbols": kept(read_jsonl(src / "symbols.jsonl")),
+         "tools": kept(read_jsonl(src / "tools.jsonl")), "examples": kept(read_jsonl(src / "examples.jsonl")),
          "cheatsheet": (src / "cheatsheet.md").read_text(encoding="utf-8") if (src / "cheatsheet.md").exists() else "",
          "skill": (src / "skill.md").read_text(encoding="utf-8") if (src / "skill.md").exists() else ""}
     errors, warnings = [], []
@@ -178,7 +195,7 @@ def read_source(src: Path) -> dict:
 def run_check(check: dict, example: dict, timeout: float = 20) -> tuple[str, str]:
     """Run one example through the pack's check command: `{file}` in the command is a file holding the code,
     the example's input goes to stdin. Passes when the command succeeds and, if the example has `expect`, its
-    output matches (whitespace at the ends ignored). Returns ("pass" | "fail" | "error", what it printed)."""
+    output matches (check "compare": exact, words or json). Returns ("pass" | "fail" | "error", the output)."""
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / ("example" + check.get("ext", ".txt"))
         f.write_text(example["code"], encoding="utf-8")
@@ -191,9 +208,37 @@ def run_check(check: dict, example: dict, timeout: float = 20) -> tuple[str, str
         out = (r.stdout + (("\n" + r.stderr) if r.stderr.strip() else "")).strip()
         if r.returncode != 0:
             return "fail", out or f"exit {r.returncode}"
-        if example.get("expect") is not None and r.stdout.strip() != str(example["expect"]).strip():
+        if example.get("expect") is not None and not same_output(r.stdout, str(example["expect"]),
+                                                                 check.get("compare", "exact")):
             return "fail", f"expected:\n{str(example['expect']).strip()}\ngot:\n{r.stdout.strip()}"
         return "pass", out
+
+
+def json_stream(text: str) -> list | None:
+    """A stream of JSON values (as jq and many tools print them: one after another, maybe comma-separated),
+    or None if it isn't one."""
+    dec, i, vals = json.JSONDecoder(), 0, []
+    while True:
+        while i < len(text) and (text[i].isspace() or text[i] == ","):
+            i += 1
+        if i >= len(text):
+            return vals
+        try:
+            v, i = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            return None
+        vals.append(v)
+
+
+def same_output(got: str, expect: str, compare: str) -> bool:
+    """exact: the same text (ends trimmed); words: the same apart from spacing; json: the same JSON values."""
+    if compare == "json":
+        a, b = json_stream(got), json_stream(expect)
+        if a is not None and b is not None:
+            return a == b
+    if compare in ("json", "words"):
+        return got.split() == expect.split() or "".join(got.split()) == "".join(expect.split())
+    return got.strip() == expect.strip()
 
 
 def compile_pack(src: Path, out: Path, check: bool = True, log=print) -> dict:
@@ -652,6 +697,766 @@ def install(lore_path: Path, base: Path) -> Path:
     return folder
 
 
+# ---- build: any documentation -> a pack source, with a model (gather, chunk, distill, verify, finish)
+
+CHUNK_CHARS = 12000     # a chunk the model reads whole: big enough for a page of reference, small enough to read well
+QUOTE_STATES = ("unreviewed", "accepted", "edited", "rejected")
+KEEP_ON_REBUILD = ("accepted", "edited", "rejected")     # a reviewer's decision outlives a rebuild
+
+
+class PageText(html.parser.HTMLParser):
+    """HTML as plain text that keeps its structure: headings as #, code blocks fenced, list items as -."""
+    SKIP = {"script", "style", "nav", "header", "footer", "noscript", "svg"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip, self.pre = [], 0, 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in ("h1", "h2", "h3", "h4"):
+            self.out.append("\n\n" + "#" * int(tag[1]) + " ")
+        elif tag == "pre":
+            self.pre += 1
+            self.out.append("\n```\n")
+        elif tag in ("p", "div", "section", "tr", "dt", "dd", "br", "table"):
+            self.out.append("\n")
+        elif tag == "li":
+            self.out.append("\n- ")
+        elif tag == "code" and not self.pre:
+            self.out.append("`")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(0, self.skip - 1)
+        elif tag == "pre":
+            self.pre = max(0, self.pre - 1)
+            self.out.append("\n```\n")
+        elif tag in ("h1", "h2", "h3", "h4", "p", "dt", "dd"):
+            self.out.append("\n")
+        elif tag == "code" and not self.pre:
+            self.out.append("`")
+        elif tag in ("td", "th"):
+            self.out.append(" | ")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data if self.pre else re.sub(r"\s+", " ", data))
+
+    def text(self) -> str:
+        t = "".join(self.out)
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(line.rstrip() for line in t.splitlines())).strip() + "\n"
+
+
+def html_text(raw: str) -> str:
+    p = PageText()
+    p.feed(raw)
+    return p.text()
+
+
+def plain(text: str) -> str:
+    """Terminal output as plain text: no colour or bold codes (man still emits them), no overstrike."""
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|.\x08", "", text)
+
+
+def slug(text: str, n: int = 48) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:n] or "x"
+
+
+def gather(sources: list[str], tools: list[str], work: Path, log=print) -> list[dict]:
+    """Every source as text in work/sources/, listed in work/sources.json: files (PDF, HTML, Markdown, text),
+    folders of them, URLs, and for each tool its --help and man page."""
+    out_dir = work / "sources"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    listed: list[dict] = []
+
+    def keep(name: str, kind: str, text: str):
+        if not text.strip():
+            log(f"  {name}: no text, skipped")
+            return
+        sid = f"{len(listed) + 1:03d}-{slug(name, 40)}"
+        (out_dir / f"{sid}.txt").write_text(text, encoding="utf-8")
+        listed.append({"id": sid, "name": name, "kind": kind, "chars": len(text)})
+        log(f"  {name}: {len(text):,} characters ({kind})")
+
+    def one_file(path: Path):
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            if not shutil.which("pdftotext"):
+                raise LoreError(f"{path}: reading PDFs needs pdftotext (poppler-utils)")
+            r = subprocess.run(["pdftotext", "-layout", str(path), "-"], capture_output=True, text=True)
+            keep(path.name, "pdf", r.stdout.replace("\f", "\n\n"))
+        elif ext in (".html", ".htm", ".xhtml"):
+            keep(path.name, "html", html_text(path.read_text(encoding="utf-8", errors="replace")))
+        elif ext in (".md", ".txt", ".rst", ".adoc", "") or ext.startswith(".man"):
+            keep(path.name, "text", path.read_text(encoding="utf-8", errors="replace"))
+
+    for src in sources:
+        if re.match(r"https?://", src):
+            req = urllib.request.Request(src, headers={"User-Agent": f"hobkin-lore/{__version__}"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                raw = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+            keep(src, "html" if "<html" in raw[:2000].lower() else "text",
+                 html_text(raw) if "<html" in raw[:2000].lower() else raw)
+            continue
+        path = Path(src).expanduser()
+        if path.is_dir():
+            for f in sorted(p for p in path.rglob("*") if p.is_file()):
+                one_file(f)
+        elif path.is_file():
+            one_file(path)
+        else:
+            raise LoreError(f"no such source: {src}")
+    for cmd in tools:
+        name = shlex.split(cmd)[0]
+        parts = []
+        for args in (["--help"], ["-h"]):
+            try:
+                r = subprocess.run(shlex.split(cmd) + args, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                raise LoreError(f"tool {cmd!r}: {e}") from None
+            if (r.stdout + r.stderr).strip():
+                parts.append(f"# {cmd} {' '.join(args)}\n\n" + plain(r.stdout + r.stderr))
+                break
+        if shutil.which("man"):
+            r = subprocess.run(["man", "-P", "cat", name], capture_output=True, text=True, timeout=30,
+                               env={**os.environ, "MANWIDTH": "100", "MAN_KEEP_FORMATTING": "0",
+                                    "GROFF_NO_SGR": "1"})
+            if r.returncode == 0 and r.stdout.strip():
+                parts.append(f"# man {name}\n\n" + plain(r.stdout))
+        keep(f"tool: {cmd}", "tool", "\n\n".join(parts))
+    (work / "sources.json").write_text(json.dumps(listed, indent=1), encoding="utf-8")
+    return listed
+
+
+def chunk(text: str, size: int = CHUNK_CHARS) -> list[tuple[int, int, str]]:
+    """Pieces of about `size` characters, cut at headings (else blank lines): (first line, last line, text),
+    lines counted from 1."""
+    lines = text.splitlines()
+    out, start, cur = [], 0, 0
+
+    def is_head(i):
+        return bool(re.match(r"#{1,4} \S", lines[i])) or (i + 1 < len(lines) and re.fullmatch(r"[=-]{3,}",
+                                                                                                lines[i + 1]))
+    for i in range(len(lines)):
+        cur += len(lines[i]) + 1
+        nxt = i + 1
+        if nxt >= len(lines):
+            break
+        if cur >= size * 0.6 and is_head(nxt) or cur >= size and not lines[nxt].strip() or cur >= size * 1.5:
+            out.append((start + 1, nxt, "\n".join(lines[start:nxt])))
+            start, cur = nxt, 0
+    if start < len(lines):
+        out.append((start + 1, len(lines), "\n".join(lines[start:])))
+    return [c for c in out if c[2].strip()]
+
+
+class Model:
+    """An OpenAI-format chat endpoint (OpenRouter, a gateway, Ollama, vLLM...), over urllib. Every answer is
+    recorded in `answers` keyed by (task, prompt, model): a rebuild asks again only what changed."""
+
+    def __init__(self, base_url: str, model: str, key: str | None, answers: Path, timeout: float = 300):
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.model, self.key, self.answers, self.timeout = model, key, answers, timeout
+        self.answers.mkdir(parents=True, exist_ok=True)
+        self.calls = 0
+        self.json_mode = True
+
+    def _post(self, messages: list[dict]) -> str:
+        body = {"model": self.model, "messages": messages}
+        if self.json_mode:
+            body["response_format"] = {"type": "json_object"}
+        req = urllib.request.Request(self.url, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json",
+                                              **({"Authorization": f"Bearer {self.key}"} if self.key else {})})
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    data = json.loads(r.read())
+                self.calls += 1
+                return data["choices"][0]["message"]["content"] or ""
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:300]
+                if e.code == 400 and self.json_mode and "response_format" in detail:
+                    self.json_mode = False          # this endpoint has no JSON mode: the prompt asks for JSON
+                    return self._post(messages)
+                if e.code in (408, 429, 500, 502, 503, 504) and attempt < 4:
+                    time.sleep(min(60, 2 ** attempt * 3))
+                    continue
+                raise LoreError(f"model call failed: HTTP {e.code}: {detail}") from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt < 4:
+                    time.sleep(min(60, 2 ** attempt * 3))
+                    continue
+                raise LoreError(f"model call failed: {e}") from None
+        raise LoreError("model call failed")
+
+    def ask(self, task: str, system: str, user: str) -> dict:
+        key = hashlib.sha256(json.dumps([task, system, user, self.model]).encode()).hexdigest()[:24]
+        f = self.answers / f"{task}-{key}.json"
+        if f.exists():
+            return json.loads(f.read_text(encoding="utf-8"))["output"]
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        for _ in range(2):
+            raw = self._post(messages)
+            m = re.search(r"\{.*\}", raw, re.S)
+            try:
+                out = json.loads(m.group(0) if m else raw)
+                problem = None if isinstance(out, dict) else "not an object"
+            except json.JSONDecodeError as e:
+                problem = str(e)
+            if not problem:
+                break
+            messages += [{"role": "assistant", "content": raw},
+                         {"role": "user", "content": f"That wasn't one JSON object ({problem}). "
+                                                     "Reply again with only the JSON object."}]
+        else:
+            raise LoreError(f"{task}: the model's answer wasn't JSON")
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"task": task, "model": self.model, "key": key, "at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"), "output": out}, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, f)
+        return out
+
+
+DISTILL_SYSTEM = """You turn one passage of documentation into reference entries for a programming language
+and its tools, for an AI that will look them up while writing code. Write entries in your own words, short
+and exact: every fact a programmer needs (names, arguments and their order, return values, defaults, errors,
+edge cases), none of the prose. Include only what this passage documents; leave lists empty otherwise.
+
+An example's "code" is only the program text in the language, exactly as it would be saved in a file: never
+the shell command that runs it (no `tool '...'` wrapper, no prompt); put such a command in "notes".
+
+Every entry needs "quote": a short passage (5 to 30 words) copied exactly, character for character, from the
+passage, that supports the entry; one stretch of text, without "..." in it. Entries whose quote isn't in the
+passage are flagged for a person to check.
+
+Reply with only a JSON object:
+{"sections": [{"title": "...", "parent": "title of the section it belongs under, or null",
+               "body": "the section's content as Markdown", "quote": "..."}],
+ "symbols": [{"name": "...", "kind": "KIND", "signature": "...", "summary": "one line",
+              "body": "details: arguments, returns, errors, edge cases", "see": ["related names"], "quote": "..."}],
+ "examples": [{"title": "...", "code": "...", "input": "input it reads, if the documentation shows one",
+               "expect": "its output, only if the documentation shows it exactly", "symbols": ["names it uses"],
+               "notes": "the command that runs it, if the documentation shows one",
+               "quote": "..."}],
+ "tools": [{"name": "command name", "purpose": "one line", "usage": "synopsis", "body": "how to use it",
+            "flags": [{"flag": "-x, --long ARG", "meaning": "..."}], "quote": "..."}]}
+
+KIND is one of: """ + ", ".join(SYMBOL_KINDS) + "."
+
+FINISH_SYSTEM = """You write the two short texts an AI reads before using a programming language's reference.
+Reply with only a JSON object:
+{"description": "two sentences: what the language is and what this reference covers",
+ "cheatsheet": "the essentials as a Markdown list, at most 25 lines: syntax rules, the mistakes people make
+most, how to run and check code with its tools",
+ "skill": "how to work in this language with its tools, a short Markdown paragraph or list: how to run, test
+or check what you write, and how to read the errors"}"""
+
+
+CALLABLE = {"function", "builtin", "method", "other"}   # one name a model may call any of these
+
+
+def uses(code: str, name: str) -> bool:
+    """Whether code mentions a name as a whole word (names like @csv or .[] by their text)."""
+    if re.fullmatch(r"\w+", name):
+        return re.search(rf"(?<![\w$]){re.escape(name)}(?!\w)", code) is not None
+    return name in code
+
+
+def norm(s: str) -> str:
+    """For finding a quote: case, spacing and Markdown's backticks and stars don't matter."""
+    return re.sub(r"\s+", " ", re.sub(r"[`*]", "", s)).strip().lower()
+
+
+def locate(quote: str, chunk_text: str, first_line: int) -> tuple[int, int] | None:
+    """The lines (in the source) a quote spans, or None if it isn't in the chunk (whitespace and case aside)."""
+    pieces = [norm(p) for p in re.split(r"\.\.\.|…", quote) if norm(p)]
+    if not pieces or sum(len(p) for p in pieces) < 8:
+        return None
+    lines = chunk_text.splitlines()
+    flat, starts = "", []
+    for i, line in enumerate(lines):
+        starts.append(len(flat))
+        n = norm(line)
+        if n:                          # a blank line adds no space: a quote may run across a paragraph break
+            flat += n + " "
+    at = flat.find(pieces[0])          # a shortened quote ("a ... b"): each piece verbatim, in order, close by
+    if at < 0:
+        return None
+    end = at + len(pieces[0])
+    for p in pieces[1:]:
+        nxt = flat.find(p, end)
+        if nxt < 0 or nxt - end > 600:
+            return None
+        end = nxt + len(p)
+    a = max(i for i, st in enumerate(starts) if st <= at)
+    b = max(i for i, st in enumerate(starts) if st <= end - 1)
+    return first_line + a, first_line + b
+
+
+def distill_all(model: Model, srcs: list[dict], work: Path, language: str, jobs: int, limit: int | None,
+                log=print) -> list[dict]:
+    """[chunk] and [distill]: every chunk of every source through the model (in parallel). Returns the raw entries,
+    each with its chunk."""
+    chunks = []
+    for s in srcs:
+        text = (work / "sources" / f"{s['id']}.txt").read_text(encoding="utf-8")
+        for a, b, t in chunk(text):
+            chunks.append({"id": f"{s['id']}:{a}-{b}", "source": s, "first": a, "last": b, "text": t})
+    if limit:
+        chunks = chunks[:limit]
+    (work / "chunks.json").write_text(json.dumps([{k: c[k] for k in ("id", "first", "last")} | {
+        "source": c["source"]["id"], "name": c["source"]["name"]} for c in chunks], indent=1), encoding="utf-8")
+    log(f"distilling {len(chunks)} chunks ({jobs} at a time)...")
+    done = [0]
+
+    def one(c):
+        user = (f"Language: {language}\nSource: {c['source']['name']}, lines {c['first']}-{c['last']}\n\n"
+                f"Passage:\n{c['text']}")
+        out = model.ask("distill", DISTILL_SYSTEM, user)
+        done[0] += 1
+        if done[0] % 10 == 0 or done[0] == len(chunks):
+            log(f"  {done[0]}/{len(chunks)}")
+        return c, out
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max(1, jobs)) as ex:
+        results = list(ex.map(one, chunks))
+    entries = []
+    for c, out in results:
+        for kind in ("sections", "symbols", "examples", "tools"):
+            for e in out.get(kind) or []:
+                if isinstance(e, dict):
+                    entries.append({"kind": kind, "entry": e, "chunk": c})
+    return entries
+
+
+def verify_and_merge(entries: list[dict]) -> dict[str, list[dict]]:
+    """[verify] and merge: each entry's quote looked up in its chunk (a line-range citation if found, a flag if
+    not), duplicates merged, ids given, sections nested, symbols tied to their chunk's section."""
+    packs: dict[str, list[dict]] = {"sections": [], "symbols": [], "examples": [], "tools": []}
+    top: dict[str, dict] = {}
+    sec_by_title: dict[tuple, str] = {}
+    sec_of_chunk: dict[str, str] = {}
+    ids: set = set()
+
+    def unique(base):
+        i, n = base, 2
+        while i in ids:
+            i, n = f"{base}-{n}", n + 1
+        ids.add(i)
+        return i
+    for item in entries:
+        e, c, kind = item["entry"], item["chunk"], item["kind"]
+        src = c["source"]
+        span = locate(str(e.get("quote") or ""), c["text"], c["first"])
+        flags = [] if span else ["quote not found in the source"]
+        cite = f"{src['name']}, lines {span[0]}-{span[1]}" if span else f"{src['name']}, lines {c['first']}-{c['last']}"
+        review = {"status": "unreviewed", "flags": flags, "quote": e.get("quote"), "chunk": c["id"]}
+        if kind == "sections":
+            if not e.get("title") or not e.get("body"):
+                continue
+            if src["id"] not in top:
+                tid = unique(slug(src["name"]))
+                top[src["id"]] = {"id": tid, "parent": None, "title": src["name"], "body": f"From {src['name']}.",
+                                  "source": src["name"], "review": {"status": "unreviewed", "flags": []}}
+                packs["sections"].append(top[src["id"]])
+            parent = sec_by_title.get((src["id"], norm(e.get("parent") or ""))) or top[src["id"]]["id"]
+            sid = unique(f"{top[src['id']]['id']}/{slug(e['title'])}")
+            sec_by_title[(src["id"], norm(e["title"]))] = sid
+            sec_of_chunk.setdefault(c["id"], sid)
+            packs["sections"].append({"id": sid, "parent": parent, "title": e["title"], "body": e["body"],
+                                      "source": cite, "review": review})
+        elif kind == "symbols":
+            name, sk = str(e.get("name") or "").strip(), e.get("kind")
+            if not name:
+                continue
+            if sk not in SYMBOL_KINDS:
+                review["flags"].append(f"kind {sk!r} wasn't one of the known kinds")
+                sk = "other"
+            same = next((y for y in packs["symbols"] if y["name"] == name and (
+                y["kind"] == sk or {y["kind"], sk} <= CALLABLE)), None)   # a model's "builtin" vs "function"
+            if same:              # documented in two places: keep the fuller, and both citations
+                if len(e.get("body") or "") > len(same.get("body") or ""):
+                    same.update({k: e.get(k) or same.get(k) for k in ("signature", "summary", "body")})
+                same["see"] = sorted(set(same["see"]) | set(e.get("see") or []))
+                same["source"] += f"; {cite}"
+                if not flags:
+                    same["review"]["flags"] = [f for f in same["review"]["flags"] if "quote" not in f]
+                continue
+            packs["symbols"].append({"name": name, "kind": sk, "signature": e.get("signature"),
+                                     "summary": e.get("summary"), "body": e.get("body"),
+                                     "section": c["id"], "source": cite,
+                                     "see": [s for s in (e.get("see") or []) if isinstance(s, str)],
+                                     "review": review})
+        elif kind == "examples":
+            if not e.get("code"):
+                continue
+            if any(x["code"].strip() == str(e["code"]).strip() and (x["input"] or "").strip() == str(
+                    e.get("input") or "").strip() for x in packs["examples"]):
+                continue                  # the same example in two places (a manual and its man page)
+            packs["examples"].append({"id": unique(f"ex-{slug(e.get('title') or e['code'][:30], 40)}"),
+                                      "title": e.get("title"), "code": e["code"], "input": e.get("input") or None,
+                                      "expect": e.get("expect") or None, "notes": e.get("notes") or None,
+                                      "symbols": [s for s in (e.get("symbols") or []) if isinstance(s, str)],
+                                      "source": cite, "review": review})
+        elif kind == "tools":
+            if not e.get("name"):
+                continue
+            same = next((t for t in packs["tools"] if t["name"] == e["name"]), None)
+            if same:
+                have = {f.get("flag") for f in same["flags"]}
+                same["flags"] += [f for f in e.get("flags") or [] if isinstance(f, dict) and f.get("flag") not in have]
+                continue
+            packs["tools"].append({"name": e["name"], "purpose": e.get("purpose"), "usage": e.get("usage"),
+                                   "body": e.get("body"), "flags": [f for f in e.get("flags") or []
+                                                                   if isinstance(f, dict)],
+                                   "runs": [], "source": cite, "review": review})
+    names = {y["name"] for y in packs["symbols"]}
+    for y in packs["symbols"]:             # tie each symbol to its chunk's first section; drop dangling see-alsos
+        y["section"] = sec_of_chunk.get(y["section"]) or None
+        y["see"] = [s for s in y["see"] if s in names and s != y["name"]]
+    for e in packs["examples"]:            # only symbols the code really uses: a model's lists are loose
+        e["symbols"] = [s for s in e["symbols"] if s in names and uses(e["code"], s)]
+    return packs
+
+
+def entry_key(kind: str, e: dict) -> str:
+    return f"{e['name']}\t{e.get('kind', '')}" if kind in ("symbols", "tools") else e.get("id", "")
+
+
+def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: str, skill: str, log=print) -> None:
+    """The pack source, keeping a reviewer's decisions: an entry accepted, edited or rejected before stays as
+    the reviewer left it; everything else is the new build."""
+    out.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    for kind, rows in packs.items():
+        old = {entry_key(kind, r): r for r in read_jsonl(out / f"{kind}.jsonl")}
+        merged, seen = [], set()
+        for r in rows:
+            k = entry_key(kind, r)
+            prev = old.get(k)
+            if prev and (prev.get("review") or {}).get("status") in KEEP_ON_REBUILD:
+                r, kept = prev, kept + 1
+            merged.append(r)
+            seen.add(k)
+        merged += [r for k, r in old.items() if k not in seen and (r.get("review") or {}).get("status")
+                   in KEEP_ON_REBUILD]                       # reviewed by hand, gone from the new build: kept
+        tmp = out / f"{kind}.jsonl.tmp"
+        tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in merged), encoding="utf-8")
+        os.replace(tmp, out / f"{kind}.jsonl")
+    (out / "pack.json").write_text(json.dumps(pack, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    work = out / ".build"
+    work.mkdir(parents=True, exist_ok=True)
+    for fname, text in (("cheatsheet.md", cheatsheet), ("skill.md", skill)):
+        # replaced only if nobody changed it since the last build wrote it
+        last, cur = work / f"generated-{fname}", out / fname
+        if not cur.exists() or (last.exists() and cur.read_text(encoding="utf-8") == last.read_text(encoding="utf-8")):
+            cur.write_text(text.strip() + "\n", encoding="utf-8")
+        else:
+            log(f"kept {fname}: it was edited by hand")
+        last.write_text(text.strip() + "\n", encoding="utf-8")
+    if kept:
+        log(f"kept {kept} entries a reviewer had accepted, edited or rejected")
+
+
+def build(name: str, sources: list[str], tools: list[str], out: Path, model: Model, title: str | None = None,
+          language: str | None = None, version: str | None = None, check: dict | None = None, jobs: int = 4,
+          limit: int | None = None, log=print) -> dict:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,40}", name):
+        raise LoreError("the name: lowercase letters, digits and hyphens (it names the skill)")
+    work = out / ".build"
+    title, language = title or name, language or title or name
+    log("gathering sources...")
+    srcs = gather(sources, tools, work, log)
+    if not srcs:
+        raise LoreError("no text in any of the sources")
+    entries = distill_all(model, srcs, work, language, jobs, limit, log)
+    packs = verify_and_merge(entries)
+    names = "\n".join(f"- {y['name']} ({y['kind']}): {y.get('summary') or ''}" for y in packs["symbols"][:400])
+    tool_lines = "\n".join(f"- {t['name']}: {t.get('purpose') or ''}" for t in packs["tools"])
+    heads = "\n".join(f"- {s['title']}" for s in packs["sections"][:200])
+    fin = model.ask("finish", FINISH_SYSTEM, f"Language: {language}\n\nSections:\n{heads}\n\nSymbols:\n{names}"
+                                             f"\n\nTools:\n{tool_lines or '(none documented)'}")
+    pack = {"name": name, "title": title, "language": language, "version": version or "",
+            "description": fin.get("description") or f"The {language} reference.",
+            "sources": [s["name"] for s in srcs]}
+    if check:
+        pack["check"] = check
+    write_pack(out, pack, packs, str(fin.get("cheatsheet") or ""), str(fin.get("skill") or ""), log)
+    flagged = sum(1 for rows in packs.values() for r in rows if (r.get("review") or {}).get("flags"))
+    return {"out": str(out), "sources": len(srcs), "chunks": len(json.loads((work / "chunks.json").read_text())),
+            **{k: len(v) for k, v in packs.items()}, "flagged": flagged, "model_calls": model.calls}
+
+
+# ---- review: a local web page to review a built pack source, entry by entry, beside the source it cites
+
+REVIEW_FIELDS = {
+    "sections": ["id", "parent", "title", "body"],
+    "symbols": ["name", "kind", "signature", "summary", "body", "see"],
+    "examples": ["id", "title", "code", "input", "expect", "notes", "symbols"],
+    "tools": ["name", "purpose", "usage", "body", "flags"],
+}
+
+
+class Review:
+    """The pack source on disk is the state: every read comes from the files, every change is written back."""
+
+    def __init__(self, src: Path):
+        if not (src / "pack.json").exists():
+            raise LoreError(f"{src} isn't a pack source (no pack.json)")
+        self.src = src
+        self.lock = threading.Lock()
+
+    def rows(self, kind: str) -> list[dict]:
+        return read_jsonl(self.src / f"{kind}.jsonl")
+
+    def save(self, kind: str, rows: list[dict]) -> None:
+        tmp = self.src / f"{kind}.jsonl.tmp"
+        tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        os.replace(tmp, self.src / f"{kind}.jsonl")
+
+    def summary(self) -> dict:
+        out = {"pack": json.loads((self.src / "pack.json").read_text(encoding="utf-8")), "kinds": {}}
+        for kind in REVIEW_FIELDS:
+            rows = self.rows(kind)
+            st = lambda r: (r.get("review") or {}).get("status", "unreviewed")  # noqa: E731
+            out["kinds"][kind] = {"total": len(rows), "flagged": sum(1 for r in rows if (r.get("review") or {})
+                                                                     .get("flags") and st(r) == "unreviewed"),
+                                  **{s: sum(1 for r in rows if st(r) == s) for s in QUOTE_STATES}}
+        return out
+
+    def listing(self, kind: str, status: str = "", q: str = "") -> list[dict]:
+        out = []
+        for r in self.rows(kind):
+            rv = r.get("review") or {}
+            if status == "flagged":
+                if not rv.get("flags") or rv.get("status", "unreviewed") != "unreviewed":
+                    continue
+            elif status and rv.get("status", "unreviewed") != status:
+                continue
+            title = r.get("title") or r.get("name") or r.get("id")
+            if q and q.lower() not in json.dumps(r, ensure_ascii=False).lower():
+                continue
+            out.append({"key": entry_key(kind, r), "title": title, "status": rv.get("status", "unreviewed"),
+                        "flags": rv.get("flags") or [], "line": r.get("summary") or r.get("purpose") or
+                        (r.get("body") or r.get("code") or "")[:120]})
+        out.sort(key=lambda e: (e["status"] != "unreviewed", not e["flags"], str(e["title"]).lower()))
+        return out
+
+    def entry(self, kind: str, key: str) -> dict:
+        r = next((r for r in self.rows(kind) if entry_key(kind, r) == key), None)
+        if r is None:
+            raise LoreError(f"no {kind} entry {key!r}")
+        return {"entry": r, "fields": REVIEW_FIELDS[kind], "context": self.context(r)}
+
+    def context(self, r: dict) -> dict | None:
+        """The cited source lines (a few around them), and which hold the quote."""
+        rv = r.get("review") or {}
+        m = re.match(r"(.+):(\d+)-(\d+)$", rv.get("chunk") or "")
+        f = self.src / ".build" / "sources" / f"{m.group(1)}.txt" if m else None
+        if not m or not f.exists():
+            return None
+        a, b = int(m.group(2)), int(m.group(3))
+        lines = f.read_text(encoding="utf-8").splitlines()
+        span = locate(str(rv.get("quote") or ""), "\n".join(lines[a - 1:b]), a)
+        lo, hi = (span[0] - 8, span[1] + 8) if span else (a, min(b, a + 60))
+        lo, hi = max(1, lo), min(len(lines), hi)
+        return {"first": lo, "lines": lines[lo - 1:hi], "quote": list(span) if span else None,
+                "chunk": [a, b], "source": next((s["name"] for s in json.loads(
+                    (self.src / ".build" / "sources.json").read_text()) if s["id"] == m.group(1)), m.group(1))}
+
+    def update(self, kind: str, key: str, fields: dict | None, status: str | None) -> dict:
+        with self.lock:
+            rows = self.rows(kind)
+            r = next((r for r in rows if entry_key(kind, r) == key), None)
+            if r is None:
+                raise LoreError(f"no {kind} entry {key!r}")
+            rv = r.setdefault("review", {})
+            changed = False
+            for k, v in (fields or {}).items():
+                if k in REVIEW_FIELDS[kind] and r.get(k) != v:
+                    r[k], changed = v, True
+            if status:
+                if status not in QUOTE_STATES:
+                    raise LoreError(f"status: one of {', '.join(QUOTE_STATES)}")
+                rv["status"] = status
+            elif changed:
+                rv["status"] = "edited"
+            rv["at"] = time.strftime("%Y-%m-%d %H:%M")
+            self.save(kind, rows)
+            return r
+
+    def check_example(self, key: str) -> dict:
+        pack = json.loads((self.src / "pack.json").read_text(encoding="utf-8"))
+        if not pack.get("check"):
+            return {"state": "unchecked", "output": "this pack has no check command (pack.json \"check\")"}
+        if not shutil.which(pack["check"]["command"].split()[0]):
+            return {"state": "unchecked", "output": f"{pack['check']['command'].split()[0]} isn't installed here"}
+        r = next((r for r in self.rows("examples") if entry_key("examples", r) == key), None)
+        if r is None:
+            raise LoreError(f"no example {key!r}")
+        state, output = run_check(pack["check"], r)
+        return {"state": state, "output": output}
+
+    def text(self, name: str, value: str | None = None) -> str:
+        if name not in ("cheatsheet.md", "skill.md"):
+            raise LoreError("only cheatsheet.md and skill.md")
+        f = self.src / name
+        if value is not None:
+            f.write_text(value, encoding="utf-8")
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+
+REVIEW_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>lore review</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#1b1f24;--muted:#5d6672;--line:#d5dae1;--accent:#2f5d8f;--ok:#2c7a46;--bad:#a8322d;--warn:#94660b;--mark:#fff1b8}
+@media (prefers-color-scheme:dark){:root{--bg:#15181c;--panel:#1d2126;--ink:#e6e9ed;--muted:#9aa4b0;--line:#343a42;--accent:#7fb0e8;--ok:#7ccf98;--bad:#f0928b;--warn:#e7c06b;--mark:#5a4a12}}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+header{padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+header b{font-size:15px}.muted{color:var(--muted)}main{display:grid;grid-template-columns:minmax(260px,360px) 1fr;height:calc(100vh - 52px)}
+@media (max-width:800px){main{grid-template-columns:1fr;height:auto}}
+#side{border-right:1px solid var(--line);overflow:auto;padding:10px}#detail{overflow:auto;padding:14px 18px}
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px}.tabs button,.filters select,.filters input{font:inherit}
+button{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent);font-weight:600}button.ok{border-color:var(--ok);color:var(--ok)}button.bad{border-color:var(--bad);color:var(--bad)}
+.filters{display:flex;gap:6px;margin-bottom:8px}.filters input{flex:1;min-width:0;padding:4px 6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink)}
+.item{padding:6px 8px;border-radius:6px;cursor:pointer;border:1px solid transparent}.item:hover{background:var(--panel)}.item.sel{border-color:var(--accent);background:var(--panel)}
+.item .t{font-weight:600;overflow-wrap:anywhere}.item .l{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip{font-size:11px;border-radius:999px;padding:0 6px;border:1px solid var(--line);margin-left:4px}.chip.accepted{color:var(--ok);border-color:var(--ok)}.chip.rejected{color:var(--bad);border-color:var(--bad)}.chip.edited{color:var(--accent);border-color:var(--accent)}.chip.flag{color:var(--warn);border-color:var(--warn)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media (max-width:1100px){.grid{grid-template-columns:1fr}}
+label{display:block;font-size:12px;color:var(--muted);margin:8px 0 2px}textarea,input.f{width:100%;font:13px/1.4 ui-monospace,monospace;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink)}
+pre.src{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+pre.src span{display:block}pre.src .hit{background:var(--mark)}pre.src .n{color:var(--muted);user-select:none;display:inline-block;width:4em}
+.acts{display:flex;gap:8px;margin:12px 0;flex-wrap:wrap}.flags{color:var(--warn)}#msg{margin-left:auto}
+</style></head><body>
+<header><b id="title">lore review</b><span id="counts" class="muted"></span><span id="msg" class="muted"></span></header>
+<main><div id="side"><div class="tabs" id="tabs"></div>
+<div class="filters"><select id="status"><option value="">all</option><option value="flagged">flagged</option><option>unreviewed</option><option>accepted</option><option>edited</option><option>rejected</option></select><input id="q" placeholder="filter"></div>
+<div id="list"></div></div><div id="detail"><p class="muted">Pick an entry. Flagged ones (their quote isn't in the source) come first.</p></div></main>
+<script>
+const TOKEN = "__TOKEN__";
+const KINDS = ["symbols","sections","examples","tools","texts"];
+let kind = "symbols", current = null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]);
+async function api(path, body) {
+  const r = await fetch(path, body ? {method:"POST", headers:{"Content-Type":"application/json","X-Lore-Token":TOKEN}, body:JSON.stringify(body)} : {});
+  const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j;
+}
+function say(t) { $("msg").textContent = t; setTimeout(() => { if ($("msg").textContent === t) $("msg").textContent = ""; }, 4000); }
+async function loadSummary() {
+  const s = await api("/api/summary");
+  $("title").textContent = `${s.pack.title} lore: review`;
+  $("tabs").innerHTML = KINDS.map((k) => { const c = s.kinds[k];
+    return `<button data-k="${k}" class="${k===kind?"on":""}">${k}${c ? ` <span class="muted">${c.total - c.unreviewed}/${c.total}</span>` : ""}</button>`; }).join("");
+  $("tabs").querySelectorAll("button").forEach((b) => b.onclick = () => { kind = b.dataset.k; current = null; loadSummary(); loadList(); });
+  const f = Object.values(s.kinds).reduce((a, c) => a + c.flagged, 0), u = Object.values(s.kinds).reduce((a, c) => a + c.unreviewed, 0);
+  $("counts").textContent = `${u} unreviewed, ${f} flagged`;
+}
+async function loadList() {
+  if (kind === "texts") { $("list").innerHTML = ["cheatsheet.md","skill.md"].map((n) => `<div class="item" data-n="${n}"><div class="t">${n}</div></div>`).join("");
+    $("list").querySelectorAll(".item").forEach((d) => d.onclick = () => openText(d.dataset.n)); return; }
+  const rows = await api(`/api/list?kind=${kind}&status=${encodeURIComponent($("status").value)}&q=${encodeURIComponent($("q").value)}`);
+  $("list").innerHTML = rows.map((r) => `<div class="item${current===r.key?" sel":""}" data-k="${esc(r.key)}"><div class="t">${esc(r.title)}<span class="chip ${r.status}">${r.status}</span>${r.flags.length?'<span class="chip flag">flag</span>':""}</div><div class="l">${esc(r.line)}</div></div>`).join("") || '<p class="muted">nothing here</p>';
+  $("list").querySelectorAll(".item").forEach((d) => d.onclick = () => openEntry(d.dataset.k));
+}
+function field(name, v) {
+  const val = typeof v === "string" || v == null ? (v ?? "") : JSON.stringify(v, null, 1);
+  const big = ["body","code","input","expect","notes","flags"].includes(name) || val.length > 80;
+  return `<label>${name}</label>` + (big ? `<textarea data-f="${name}" rows="${Math.min(18, Math.max(3, val.split("\n").length + 1))}">${esc(val)}</textarea>` : `<input class="f" data-f="${name}" value="${esc(val)}">`);
+}
+async function openEntry(key) {
+  current = key; loadList();
+  const d = await api(`/api/entry?kind=${kind}&key=${encodeURIComponent(key)}`), e = d.entry, rv = e.review || {}, c = d.context;
+  const src = c ? `<label>${esc(c.source)}, lines ${c.first}-${c.first + c.lines.length - 1}${c.quote ? "" : " (the quote isn't here: this is the chunk it came from)"}</label><pre class="src">${c.lines.map((l, i) => { const n = c.first + i, hit = c.quote && n >= c.quote[0] && n <= c.quote[1];
+      return `<span class="${hit?"hit":""}"><span class="n">${n}</span>${esc(l)}</span>`; }).join("")}</pre>` : '<p class="muted">no source context (hand-written, or the build folder is gone)</p>';
+  $("detail").innerHTML = `<h2 style="margin:0 0 4px">${esc(e.title || e.name || e.id)} <span class="chip ${rv.status||"unreviewed"}">${rv.status||"unreviewed"}</span></h2>
+    ${rv.flags && rv.flags.length ? `<p class="flags">${rv.flags.map(esc).join("; ")}</p>` : ""}
+    <p class="muted">quote: “${esc(rv.quote || "")}” · cited as: ${esc(e.source || "")}</p>
+    <div class="acts"><button class="ok" id="acc">Accept</button><button id="sav">Save edits</button><button class="bad" id="rej">Reject</button>
+      ${kind==="examples" ? '<button id="chk">Run the check</button>' : ""}<span id="chkout" class="muted"></span></div>
+    <div class="grid"><div>${d.fields.map((f) => field(f, e[f])).join("")}</div><div>${src}</div></div>`;
+  const fields = () => { const o = {}; $("detail").querySelectorAll("[data-f]").forEach((el) => { let v = el.value;
+    if (["see","symbols","flags"].includes(el.dataset.f)) { try { v = JSON.parse(v || "[]"); } catch { v = v.split(",").map((s) => s.trim()).filter(Boolean); } }
+    else if (v === "" && ["parent","signature","input","expect","notes"].includes(el.dataset.f)) v = null;
+    o[el.dataset.f] = v; }); return o; };
+  const act = async (status, withFields) => { try { await api("/api/update", {kind, key, status, fields: withFields ? fields() : null});
+    say(status ? status : "saved"); await loadSummary(); await openEntry(key); } catch (err) { say("error: " + err.message); } };
+  $("acc").onclick = () => act("accepted", true); $("rej").onclick = () => act("rejected", false); $("sav").onclick = () => act(null, true);
+  if ($("chk")) $("chk").onclick = async () => { $("chkout").textContent = "running..."; const r = await api("/api/check", {key});
+    $("chkout").textContent = `${r.state}${r.output ? ": " + r.output.slice(0, 300) : ""}`; };
+}
+async function openText(name) {
+  const t = await api(`/api/text?name=${name}`);
+  $("detail").innerHTML = `<h2>${name}</h2><textarea id="tx" rows="24">${esc(t.text)}</textarea><div class="acts"><button id="sv">Save</button></div>`;
+  $("sv").onclick = async () => { await api("/api/text", {name, text: $("tx").value}); say("saved"); };
+}
+$("status").onchange = loadList; let tq; $("q").oninput = () => { clearTimeout(tq); tq = setTimeout(loadList, 250); };
+loadSummary().then(loadList);
+</script></body></html>"""
+
+
+def review_server(src: Path, host: str = "127.0.0.1", port: int = 8765):
+    """The review page and its little API. Changes need the token embedded in the page, so another site open
+    in the same browser can't post to it."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+    rv, token = Review(src), secrets.token_urlsafe(16)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, obj, ctype="application/json; charset=utf-8"):
+            raw = obj.encode() if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            u = urlsplit(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            try:
+                if u.path == "/":
+                    return self.send(200, REVIEW_PAGE.replace("__TOKEN__", token), "text/html; charset=utf-8")
+                if u.path == "/api/summary":
+                    return self.send(200, rv.summary())
+                if u.path == "/api/list":
+                    return self.send(200, rv.listing(q.get("kind", "symbols"), q.get("status", ""), q.get("q", "")))
+                if u.path == "/api/entry":
+                    return self.send(200, rv.entry(q.get("kind", ""), q.get("key", "")))
+                if u.path == "/api/text":
+                    return self.send(200, {"text": rv.text(q.get("name", ""))})
+                self.send(404, {"error": "not found"})
+            except (LoreError, KeyError) as e:
+                self.send(400, {"error": str(e)})
+
+        def do_POST(self):
+            if self.headers.get("X-Lore-Token") != token:
+                return self.send(403, {"error": "no token: use the review page"})
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                if self.path == "/api/update":
+                    return self.send(200, rv.update(body["kind"], body["key"], body.get("fields"), body.get("status")))
+                if self.path == "/api/check":
+                    return self.send(200, rv.check_example(body["key"]))
+                if self.path == "/api/text":
+                    return self.send(200, {"text": rv.text(body["name"], body["text"])})
+                self.send(404, {"error": "not found"})
+            except (LoreError, KeyError, json.JSONDecodeError) as e:
+                self.send(400, {"error": str(e)})
+
+    srv = ThreadingHTTPServer((host, port), H)
+    srv.token = token
+    return srv
+
+
 # ---- mcp: the lookups as an MCP server (stdio), for VS Code, Cursor, Claude Desktop and any other MCP client
 
 MCP_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")    # newest first; we answer in the client's if we know it
@@ -803,6 +1608,31 @@ def parser() -> argparse.ArgumentParser:
     e.add_argument("--symbol")
     e.add_argument("--id")
     e.add_argument("-n", type=int, default=5)
+    b = sub.add_parser("build", help="build a pack source from documentation, with a model")
+    b.add_argument("name", help="the lore's name (lowercase, hyphens): it names the skill, NAME-lore")
+    b.add_argument("sources", nargs="*", help="PDF, HTML, Markdown or text files, folders of them, or URLs")
+    b.add_argument("--tool", action="append", default=[], metavar="CMD",
+                   help="a command-line tool of the language: its --help and man page are read (repeatable)")
+    b.add_argument("--out", help="the pack source folder to write (default: packs/NAME)")
+    b.add_argument("--title")
+    b.add_argument("--language", help="the language's name, if it isn't the title")
+    b.add_argument("--version", dest="lang_version", help="the language's version the documentation is for")
+    b.add_argument("--check", metavar="CMD", help="a command that runs an example: {file} is its code, its input "
+                   "goes on stdin, e.g. 'jq -c -f {file}'")
+    b.add_argument("--check-ext", default=".txt", help="the example file's extension, for --check")
+    b.add_argument("--check-compare", choices=["exact", "words", "json"], default="exact",
+                   help="how an example's output is compared with its expected output (json: as JSON values)")
+    b.add_argument("--base-url", default=os.environ.get("LORE_BASE_URL"),
+                   help="an OpenAI-format endpoint (default: $LORE_BASE_URL), e.g. https://openrouter.ai/api/v1")
+    b.add_argument("--model", default=os.environ.get("LORE_MODEL"), help="the model (default: $LORE_MODEL)")
+    b.add_argument("--key-env", default="LORE_API_KEY", help="the variable holding the API key (default: "
+                   "LORE_API_KEY; none needed for a local endpoint)")
+    b.add_argument("--jobs", type=int, default=4, help="chunks read at once (default 4)")
+    b.add_argument("--limit", type=int, help="only the first N chunks (to try a build cheaply)")
+    r = sub.add_parser("review", help="review a built pack source in the browser")
+    r.add_argument("src", help="the pack source folder")
+    r.add_argument("--port", type=int, default=8765)
+    r.add_argument("--host", default="127.0.0.1")
     m = sub.add_parser("mcp", help="serve lores as an MCP server over stdio (for VS Code, Cursor, Claude Desktop...)")
     m.add_argument("lores", nargs="*", metavar="LORE", help="the .lore.db files (default: --lore, $LORE, or the one "
                    "beside lore.py)")
@@ -836,6 +1666,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"installed: {folder}\n  SKILL.md, lore.py, {Path(args.lore_file).name}"
                   f"\n  try: python3 {folder / 'lore.py'} info"
                   f"\n  as an MCP server (VS Code, Cursor, Claude Desktop): python3 {folder / 'lore.py'} mcp")
+            return 0
+        if args.cmd == "build":
+            if not args.base_url or not args.model:
+                raise LoreError("build needs a model: --base-url and --model (or LORE_BASE_URL and LORE_MODEL)")
+            if not args.sources and not args.tool:
+                raise LoreError("build from what? give documentation (files, folders, URLs) and/or --tool CMD")
+            out = Path(args.out or f"packs/{args.name}")
+            model = Model(args.base_url, args.model, os.environ.get(args.key_env), out / ".build" / "answers")
+            check = {"command": args.check, "ext": args.check_ext,
+                     "compare": args.check_compare} if args.check else None
+            r = build(args.name, args.sources, args.tool, out, model, args.title, args.language, args.lang_version,
+                      check, args.jobs, args.limit)
+            print(f"{r['out']}: {r['sources']} sources, {r['chunks']} chunks -> {r['sections']} sections, "
+                  f"{r['symbols']} symbols, {r['examples']} examples, {r['tools']} tools; {r['flagged']} flagged "
+                  f"for review; {r['model_calls']} model calls (the rest were recorded)"
+                  f"\n  next: hobkin-lore review {r['out']}   then: hobkin-lore compile {r['out']}")
+            return 0
+        if args.cmd == "review":
+            srv = review_server(Path(args.src), args.host, args.port)
+            print(f"reviewing {args.src}: http://{args.host}:{srv.server_address[1]}/  (Ctrl-C to stop)")
+            try:
+                srv.serve_forever()
+            except KeyboardInterrupt:
+                pass
             return 0
         if args.cmd == "mcp":
             paths = [Path(p).expanduser() for p in args.lores] or [find_lore(args.lore)]
