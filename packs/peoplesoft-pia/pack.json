@@ -1,0 +1,17 @@
+{
+  "name": "peoplesoft-pia",
+  "title": "PeopleSoft pages with Playwright",
+  "language": "Playwright tests of PeopleSoft pages",
+  "version": "",
+  "description": "Testing PeopleSoft Internet Architecture (PIA) pages with Playwright for Python: how classic and Fluid pages are put together (the TargetContent frame, /psp/ and /psc/ URLs, RECORD_FIELD$row ids, server round trips, toolbar buttons and message boxes whose ids start with #) and how to drive them reliably. A hand-written starter from general PeopleSoft knowledge: ids and behaviour vary by PeopleTools version, so verify on your pages, extend it with your team's own test scripts (hobkin-lore build), and note what differs.",
+  "sources": [
+    "general PeopleSoft knowledge: verify on your PeopleTools version",
+    "Playwright for Python documentation"
+  ],
+  "check": {
+    "command": "python3 {pack}/files/run_snippet.py {file}",
+    "ext": ".py",
+    "compare": "words",
+    "timeout": 60
+  }
+}

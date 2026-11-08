@@ -114,15 +114,31 @@ A lore is compiled from a pack source: a folder of plain files you can read, rev
 | `tools.jsonl` | One per command-line tool: `name`, `purpose`, `usage`, `body`, `flags` (`flag`, `meaning`), `runs` (`command`, `output`) |
 | `cheatsheet.md` | The essentials: a screenful at most |
 | `skill.md` | How to work in this language (testing, conventions), added to the skill's instructions |
+| `files/` | Helper files that ship with the lore (a check harness, test fixtures, small scripts for its tools): stored inside the `.lore.db`, written to the skill folder's `files/` on install, listed in its `SKILL.md` |
 
 `source` on every section and symbol says where in the original documentation it came from, so a reviewer can
 check it.
+
+**Packs that come with it:** [`packs/jq`](packs/jq), a small sample (a language and its tool), and
+[`packs/peoplesoft-pia`](packs/peoplesoft-pia): testing PeopleSoft pages (PIA) with Playwright for Python. That
+one is a hand-written starter from general PeopleSoft knowledge (the TargetContent frame, `/psp/` and `/psc/`
+URLs, `RECORD_FIELD$row` ids, waiting out server round trips, toolbar and message-box ids that start with `#`),
+whose examples run against a small imitation of PIA's structure in its `files/` (they pass where Playwright and
+Chromium are installed, and are unchecked elsewhere). Ids and behaviour vary by PeopleTools version: verify on
+your pages, note what differs, and extend it with your team's own test scripts (`hobkin-lore build` into the same
+folder keeps everything written by hand).
 
 **Checked examples.** With `check` in `pack.json`, `compile` runs every example through the language's own
 tool and records whether it ran as shown: `{"command": "jq -c -f {file}", "ext": ".jq"}` writes the example's
 code to `{file}`, feeds its `input` on stdin, and compares the output with `expect`. A failing example fails the
 compile (exit 1) and is marked as failed in the lore, so an agent knows not to trust it. `--no-check` skips
 this, for instance where the tool isn't installed.
+
+**A harness for checks.** When examples need more than a command to run (a browser, a server, a fixture), put
+the harness in `files/` and point `check` at it with `{pack}`, the pack source folder: `{"command": "python3
+{pack}/files/run_snippet.py {file}", "ext": ".py", "compare": "words", "timeout": 60}`. A harness that can't
+run where it is (no browser installed, say) exits with code 77: the example is recorded as unchecked, not
+failed, so a lore still compiles on a machine without it.
 
 **One schema at a time.** A lore records its schema version, and `lore.py` refuses a lore of another version
 with "rebuild it": lores are built artifacts, rebuilt from their source, never converted.
@@ -162,8 +178,9 @@ hobkin-lore compile packs/jq         # then compile and install as usual
 5. **Finish.** The model writes the description, the cheatsheet and the skill text from the merged entries.
 
 Every model answer is recorded in `.build/answers/`, keyed by the prompt and model: a rebuild asks again only
-about what changed. A reviewer's decisions outlive a rebuild: entries accepted, edited or rejected stay as the
-reviewer left them, and a hand-edited cheatsheet or skill text is kept. `--limit N` tries a build on the first
+about what changed. What people did outlives a rebuild: entries written by hand, and entries accepted, edited or
+rejected in review, stay as they are, and a hand-edited cheatsheet or skill text is kept. So a build can also
+extend a hand-written pack. `--limit N` tries a build on the first
 N chunks. With `--check`, `compile` runs the examples; `--check-compare json` compares their output as JSON
 values (spacing aside), `words` ignoring spacing, `exact` (the default) as text.
 

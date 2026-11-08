@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- An imitation of a classic component page's structure (as served at /psc/): ids RECORD_FIELD$row, a server
+     round trip after a field changes (a processing indicator, then dependent fields update), toolbar buttons
+     whose ids start with "#" (#ICSave, #ICList), and a message box whose OK button's id is "#ICOK". For checking examples; not PeopleSoft's markup. -->
+<html><head><title>Job Data</title>
+<style>#WAIT_win0{display:none} #alertmsg{display:none;border:1px solid #888;padding:8px}</style></head><body>
+<form id="win0" onsubmit="return false">
+<h1 id="PAGETITLE">Job Data</h1>
+<div id="WAIT_win0">Processing...</div>
+<label for="JOB_EMPLID$0">Empl ID</label> <input id="JOB_EMPLID$0" name="JOB_EMPLID$0">
+<span id="PERSON_NAME_NAME$0"></span>
+<table id="JOB$scroll$0">
+  <tr><td><label for="JOB_DEPTID$0">Department</label></td><td><input id="JOB_DEPTID$0" value="10000"></td></tr>
+  <tr><td><label for="JOB_DEPTID$1">Department</label></td><td><input id="JOB_DEPTID$1" value="10100"></td></tr>
+</table>
+<input type="button" id="#ICSave" name="#ICSave" value="Save">
+<input type="button" id="#ICList" name="#ICList" value="Return to Search">
+<div id="alertmsg" role="dialog"><span id="alertmsgtext"></span> <input type="button" id="#ICOK" value="OK"></div>
+</form>
+<script>
+const names = {"KU0001": "Betty Locher", "KU0002": "Kenneth Schumacher"};
+const wait = document.getElementById("WAIT_win0");
+function roundTrip(after) {                  // the server trip: processing shows, then the page updates
+  wait.style.display = "block";
+  setTimeout(() => { after(); wait.style.display = "none"; }, 600);
+}
+document.getElementById("JOB_EMPLID$0").addEventListener("change", (e) => roundTrip(() => {
+  document.getElementById("PERSON_NAME_NAME$0").textContent = names[e.target.value] || "Invalid value";
+}));
+document.getElementById("#ICSave").addEventListener("click", () => roundTrip(() => {
+  document.getElementById("alertmsgtext").textContent = "Saved (0,0)";
+  document.getElementById("alertmsg").style.display = "block";
+}));
+document.getElementById("#ICOK").addEventListener("click", () => {
+  document.getElementById("alertmsg").style.display = "none";
+});
+</script></body></html>

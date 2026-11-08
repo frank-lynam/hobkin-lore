@@ -51,6 +51,7 @@ from __future__ import annotations
 __version__ = "0.2.0"
 
 import argparse
+import base64
 import difflib
 import hashlib
 import html.parser
@@ -109,6 +110,7 @@ CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, at TEXT, by TEXT, ref 
 """
 
 SOURCE_FILES = ("pack.json", "sections.jsonl", "symbols.jsonl", "tools.jsonl", "examples.jsonl", "operations.json",
+                "files/",
                 "cheatsheet.md", "skill.md")
 
 
@@ -182,6 +184,27 @@ def read_jsonl(path: Path) -> list[dict]:
     return out
 
 
+FILES_LIMIT = 20 * 1024 * 1024   # a lore's helper files, all together (a lore stays one file you can hand over)
+
+
+def read_files(folder: Path) -> list[dict]:
+    """The pack source's files/ folder: helpers that ship with the lore (a check harness, test fixtures, small
+    scripts for its tools). Stored inside the lore, written into the skill folder on install."""
+    if not folder.is_dir():
+        return []
+    out, total = [], 0
+    for f in sorted(folder.rglob("*")):
+        rel = f.relative_to(folder)
+        if not f.is_file() or any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+            continue
+        data = f.read_bytes()
+        total += len(data)
+        if total > FILES_LIMIT:
+            raise LoreError(f"files/ holds more than {FILES_LIMIT // 1024 // 1024} MB: keep a lore's files small")
+        out.append({"path": rel.as_posix(), "data": data, "exec": bool(f.stat().st_mode & 0o111)})
+    return out
+
+
 def read_source(src: Path) -> dict:
     """A pack source folder, read and checked. Errors stop the compile; warnings are returned."""
     if not (src / "pack.json").exists():
@@ -199,7 +222,8 @@ def read_source(src: Path) -> dict:
          "cheatsheet": (src / "cheatsheet.md").read_text(encoding="utf-8") if (src / "cheatsheet.md").exists() else "",
          "skill": (src / "skill.md").read_text(encoding="utf-8") if (src / "skill.md").exists() else "",
          "operations": json.loads((src / "operations.json").read_text(encoding="utf-8"))
-         if (src / "operations.json").exists() else {}}
+         if (src / "operations.json").exists() else {},
+         "files": read_files(src / "files")}
     errors, warnings = [], []
     ids = [s.get("id") for s in p["sections"]]
     for s in p["sections"]:
@@ -252,20 +276,28 @@ def read_source(src: Path) -> dict:
 
 # ---- compile: pack source -> .lore.db (running the examples through the pack's check command)
 
-def run_check(check: dict, example: dict, timeout: float = 20) -> tuple[str, str]:
+def run_check(check: dict, example: dict, timeout: float | None = None,
+              pack_dir: Path | None = None) -> tuple[str, str]:
     """Run one example through the pack's check command: `{file}` in the command is a file holding the code,
     the example's input goes to stdin. Passes when the command succeeds and, if the example has `expect`, its
-    output matches (check "compare": exact, words or json). Returns ("pass" | "fail" | "error", the output)."""
+    output matches (check "compare": exact, words or json). `{pack}` is the pack source folder (for a harness
+    in its files/), "timeout" in seconds. Exit 77 means the check can't run here: "unchecked", not "fail".
+    Returns ("pass" | "fail" | "error" | "unchecked", the output)."""
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / ("example" + check.get("ext", ".txt"))
         f.write_text(example["code"], encoding="utf-8")
-        cmd = check["command"].replace("{file}", str(f))
+        cmd = check["command"].replace("{file}", shlex.quote(str(f)))
+        if pack_dir is not None:
+            cmd = cmd.replace("{pack}", shlex.quote(str(Path(pack_dir).resolve())))
+        timeout = timeout or float(check.get("timeout", 20))
         try:
             r = subprocess.run(cmd, shell=True, input=example.get("input") or "", capture_output=True, text=True,
                                timeout=timeout, cwd=tmp)
         except subprocess.TimeoutExpired:
             return "error", f"timed out after {timeout:g}s"
         out = (r.stdout + (("\n" + r.stderr) if r.stderr.strip() else "")).strip()
+        if r.returncode == 77:          # the harness can't run here (no browser, no service): not a failure
+            return "unchecked", out
         if r.returncode != 0:
             return "fail", out or f"exit {r.returncode}"
         if example.get("expect") is not None and not same_output(r.stdout, str(example["expect"]),
@@ -321,6 +353,9 @@ def compile_pack(src: Path, out: Path, check: bool = True, log=print) -> dict:
             "check": json.dumps(pack.get("check")) if pack.get("check") else "",
             "cheatsheet": p["cheatsheet"], "skill": p["skill"], "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "operations": json.dumps(p["operations"]) if p["operations"] else "",
+            "files": json.dumps([{"path": f["path"], "exec": f["exec"],
+                                  "data": base64.b64encode(f["data"]).decode()} for f in p["files"]])
+            if p["files"] else "",
             "built_by": f"hobkin-lore {__version__}"}
     con.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
     for i, s in enumerate(p["sections"]):
@@ -343,12 +378,13 @@ def compile_pack(src: Path, out: Path, check: bool = True, log=print) -> dict:
                     (t["name"], t["name"], " ".join(filter(None, [t.get("purpose"), t.get("usage"), t.get("body"),
                                                                   flags]))))
     chk = pack.get("check")
-    can_check = bool(check and chk and shutil.which(chk["command"].split()[0]))
+    runner = shlex.split(chk["command"].replace("{pack}", str(src.resolve())))[0] if chk else ""
+    can_check = bool(check and chk and shutil.which(runner))     # (a harness in files/ is found through {pack})
     if check and chk and not can_check:
-        log(f"note: {chk['command'].split()[0]} isn't installed here, so the examples aren't checked")
+        log(f"note: {runner} isn't installed here, so the examples aren't checked")
     results = {"pass": 0, "fail": 0, "error": 0, "unchecked": 0}
     for e in p["examples"]:
-        state, output = run_check(chk, e) if can_check else ("unchecked", "")
+        state, output = run_check(chk, e, pack_dir=src) if can_check else ("unchecked", "")
         results[state] += 1
         if state in ("fail", "error"):
             log(f"example {e['id']}: {state}\n{textwrap.indent(output, '    ')}")
@@ -419,7 +455,8 @@ def cmd_info(lore: Lore, args) -> str:
     lines = [f"{m['title']}{' ' + m['version'] if m.get('version') else ''}: {m['description']}",
              f"{n('sections')} sections, {n('symbols')} symbols, {n('tools')} tools, {n('examples')} examples"
              + (f" ({checked.get('pass', 0)} checked and passing)" if checked.get("pass") else ""),
-             f"notes: {len(lore.notes.all())} (in {lore.notes.path.name})",
+             f"notes: {len(lore.notes.all())} (in {lore.notes.path.name})"
+             + (f"; files: {len(lore_files(m))} (installed in the skill folder's files/)" if m.get("files") else ""),
              f"built {m.get('built_at', '?')} by {m.get('built_by', '?')}"]
     srcs = json.loads(m.get("sources") or "[]")
     if srcs:
@@ -680,6 +717,24 @@ def cmd_notes(lore: Lore, args) -> str:
 
 # ---- install: the skill folder for hobkin and Claude Code: SKILL.md, lore.py, the lore
 
+def lore_files(meta: dict) -> list[dict]:
+    return [{"path": f["path"], "exec": f.get("exec", False), "data": base64.b64decode(f["data"])}
+            for f in json.loads(meta.get("files") or "[]")]
+
+
+def file_note(f: dict) -> str:
+    """What a helper file is: its first comment or docstring line, if it has one."""
+    try:
+        text = f["data"][:2000].decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    for line in text.splitlines():
+        t = re.sub(r"^<!--|-->$", "", line.strip()).strip().strip('"').strip("'").lstrip("#/*").strip()
+        if t and not t.startswith("!") and not t.lower().startswith(("<!doctype", "<html", "-*-")):
+            return t[:140]
+    return ""
+
+
 def skill_md(meta: dict, has_tools: bool, has_examples: bool) -> str:
     """SKILL.md in the format hobkin and Claude Code both read: name and description in front matter, then the
     instructions. The description says when to use it, since that's all an agent sees before opening it."""
@@ -726,6 +781,12 @@ def skill_md(meta: dict, has_tools: bool, has_examples: bool) -> str:
               "can check them.",
               f"{6 if has_tools else 5}. When the reference was wrong, missing or surprising, `note` it "
               "(with `--on NAME`), so the next lookup shows it.", ""]
+    files = lore_files(meta)
+    if files:
+        lines += ["## Files that come with it", "",
+                  "In this skill's folder, under `files/` (use them by their full path):", ""]
+        lines += [f"- `files/{f['path']}`" + (f": {file_note(f)}" if file_note(f) else "") for f in files[:40]]
+        lines += [""]
     ops = json.loads(meta.get("operations") or "{}")
     if ops.get("operations"):
         have = ", ".join(sorted(ops["operations"]))
@@ -774,6 +835,15 @@ def install(lore_path: Path, base: Path) -> Path:
             old.unlink()
     shutil.copyfile(lore_path, folder / f"{meta['name']}.lore.db")
     shutil.copyfile(Path(__file__).resolve(), folder / "lore.py")
+    shutil.rmtree(folder / "files", ignore_errors=True)       # the lore's files, as this version of it has them
+    for f in lore_files(meta):
+        target = (folder / "files" / f["path"]).resolve()
+        if not str(target).startswith(str((folder / "files").resolve()) + os.sep):
+            raise LoreError(f"refusing a file outside the skill folder: {f['path']!r}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(f["data"])
+        if f["exec"]:
+            target.chmod(target.stat().st_mode | 0o111)
     (folder / "SKILL.md").write_text(skill_md(meta, has_tools, has_examples), encoding="utf-8")
     return folder
 
@@ -1288,10 +1358,16 @@ def entry_key(kind: str, e: dict) -> str:
     return f"{e['name']}\t{e.get('kind', '')}" if kind in ("symbols", "tools") else e.get("id", "")
 
 
+def by_hand(r: dict) -> bool:
+    """An entry a person wrote (no review record: build never makes one without) or reviewed (accepted, edited,
+    rejected): a rebuild keeps it as it is."""
+    return "review" not in r or (r.get("review") or {}).get("status") in KEEP_ON_REBUILD
+
+
 def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: str, skill: str, log=print,
                ops: dict | None = None) -> None:
-    """The pack source, keeping a reviewer's decisions: an entry accepted, edited or rejected before stays as
-    the reviewer left it; everything else is the new build."""
+    """The pack source, keeping what people did: entries written by hand, and entries accepted, edited or rejected
+    in review, stay as they are; everything else is the new build. So a build can extend a hand-written pack."""
     out.mkdir(parents=True, exist_ok=True)
     kept = 0
     for kind, rows in packs.items():
@@ -1300,12 +1376,11 @@ def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: 
         for r in rows:
             k = entry_key(kind, r)
             prev = old.get(k)
-            if prev and (prev.get("review") or {}).get("status") in KEEP_ON_REBUILD:
+            if prev and by_hand(prev):
                 r, kept = prev, kept + 1
             merged.append(r)
             seen.add(k)
-        merged += [r for k, r in old.items() if k not in seen and (r.get("review") or {}).get("status")
-                   in KEEP_ON_REBUILD]                       # reviewed by hand, gone from the new build: kept
+        merged += [r for k, r in old.items() if k not in seen and by_hand(r)]   # not in the new build: kept
         tmp = out / f"{kind}.jsonl.tmp"
         tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in merged), encoding="utf-8")
         os.replace(tmp, out / f"{kind}.jsonl")
@@ -1324,7 +1399,7 @@ def write_pack(out: Path, pack: dict, packs: dict[str, list[dict]], cheatsheet: 
             log(f"kept {fname}: it was edited by hand")
         last.write_text(text.strip() + "\n", encoding="utf-8")
     if kept:
-        log(f"kept {kept} entries a reviewer had accepted, edited or rejected")
+        log(f"kept {kept} entries written or reviewed by hand")
 
 
 OPERATIONS_SYSTEM = """You set up how a team works on code that lives in a database, through its command-line
@@ -1506,7 +1581,7 @@ class Review:
         r = next((r for r in self.rows("examples") if entry_key("examples", r) == key), None)
         if r is None:
             raise LoreError(f"no example {key!r}")
-        state, output = run_check(pack["check"], r)
+        state, output = run_check(pack["check"], r, pack_dir=self.src)
         return {"state": state, "output": output}
 
     def text(self, name: str, value: str | None = None) -> str:

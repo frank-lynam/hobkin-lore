@@ -243,6 +243,64 @@ class LoreTest(unittest.TestCase):
                                                                     "method": "tools/list"}) + "\n")
         self.assertIn('"name": "symbol"', r.stdout)
 
+    # --- files that come with a lore
+    def test_files_ride_in_the_lore_and_land_in_the_skill_folder(self):
+        src = self.tmp / "withfiles"
+        shutil.copytree(JQ, src)
+        (src / "files" / "sub").mkdir(parents=True)
+        (src / "files" / "check.sh").write_text("#!/bin/sh\n# runs an example: exit 77 when it can't\n"
+                                                 "[ -n \"$SKIP\" ] && exit 77\njq -c -f \"$1\"\n")
+        (src / "files" / "check.sh").chmod(0o755)
+        (src / "files" / "sub" / "data.json").write_text('{"a": 1}')
+        (src / "files" / ".hidden").write_text("not shipped")
+        pack = json.loads((src / "pack.json").read_text())
+        pack["check"] = {"command": "{pack}/files/check.sh {file}", "ext": ".jq"}
+        (src / "pack.json").write_text(json.dumps(pack))
+        lore = self.tmp / "withfiles.lore.db"
+        if shutil.which("jq"):
+            r = hl.compile_pack(src, lore, log=lambda *_: None)            # the check runs the harness from {pack}
+            self.assertEqual(r["checked"]["pass"], 12)
+        os.environ["SKIP"] = "1"
+        try:
+            r = hl.compile_pack(src, lore, log=lambda *_: None)
+        finally:
+            del os.environ["SKIP"]
+        self.assertEqual(r["checked"], {"pass": 0, "fail": 0, "error": 0, "unchecked": 12})   # exit 77: skipped
+        skills = self.tmp / "skills-files"
+        folder = hl.install(lore, skills)
+        self.assertEqual(sorted(p.relative_to(folder / "files").as_posix() for p in (folder / "files").rglob("*")
+                                if p.is_file()), ["check.sh", "sub/data.json"])
+        self.assertTrue(os.access(folder / "files" / "check.sh", os.X_OK))
+        md = (folder / "SKILL.md").read_text()
+        self.assertIn("`files/check.sh`: runs an example: exit 77 when it can't", md)
+        self.assertIn("files: 2", hl.cmd_info(hl.Lore(lore), None))
+        # a reinstall replaces the files with the lore's current ones; notes stay
+        (folder / "files" / "stray.txt").write_text("x")
+        hl.install(lore, skills)
+        self.assertFalse((folder / "files" / "stray.txt").exists())
+
+    def test_a_file_path_cant_escape_the_skill_folder(self):
+        evil = self.tmp / "evil.lore.db"
+        shutil.copyfile(self.lore, evil)
+        con = sqlite3.connect(evil)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('files', ?)",
+                    (json.dumps([{"path": "../../escaped.txt", "exec": False, "data": "eA=="}]),))
+        con.commit()
+        con.close()
+        with self.assertRaises(hl.LoreError):
+            hl.install(evil, self.tmp / "skills-evil")
+        self.assertFalse((self.tmp / "escaped.txt").exists())
+
+    def test_the_peoplesoft_pages_pack(self):
+        r = hl.compile_pack(ROOT / "packs" / "peoplesoft-pia", self.tmp / "pia.lore.db", log=lambda *_: None)
+        self.assertEqual(r["checked"]["fail"] + r["checked"]["error"], 0)  # pass with Playwright, else unchecked
+        self.assertEqual(r["examples"], 8)
+        lo = hl.Lore(self.tmp / "pia.lore.db")
+        self.assertIn("[id='#ICSave']", hl.cmd_symbol(lo, type("A", (), {"name": "#ICSave"})))
+        files = [f["path"] for f in hl.lore_files(lo.meta)]
+        self.assertIn("run_snippet.py", files)
+        self.assertIn("fixture/content.html", files)
+
 
 if __name__ == "__main__":
     unittest.main()

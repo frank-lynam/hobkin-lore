@@ -180,6 +180,34 @@ Then commit with git as usual. When writing PeopleCode, look things up in the Pe
 (`python3 ~/.claude/skills/peoplecode-lore/lore.py symbol NAME`); Claude Code does this on its own once the
 skills are installed.
 
+## Step 8 (optional): testing PeopleSoft pages with Playwright
+
+hobkin-lore comes with a starter lore for writing Playwright (Python) tests of PeopleSoft pages: how pages are
+framed, which ids to use, how to wait for the server. It's in the source package.
+
+```sh
+pip download --no-deps --no-binary :all: hobkin-lore -d /tmp/hl && tar xzf /tmp/hl/hobkin_lore-*.tar.gz -C /tmp/hl
+cp -r /tmp/hl/hobkin_lore-*/packs/peoplesoft-pia packs/peoplesoft-pia      # keep it with the other packs
+hobkin-lore compile packs/peoplesoft-pia
+hobkin-lore install peoplesoft-pia.lore.db --claude
+```
+
+Success: `compile` prints `8 examples` with `8 pass` (when Playwright for Python and Chromium are installed)
+or `8 unchecked` (when they aren't; that's fine). Never `fail`.
+
+Then make it match this site:
+
+1. With a developer, open a real classic component and a real Fluid page and compare with the lore
+   (`lore.py show pia/ids`, `pia/toolbar`, `pia/roundtrips`): the frame id, the processing indicator, the
+   toolbar ids, the message box. Where this site differs, `lore.py note "what it really is" --on ENTRY`
+   (it shows up in every later lookup), or fix the entry in `packs/peoplesoft-pia/` and compile again.
+2. If the team has existing Playwright (or Selenium) tests of PeopleSoft pages, add them:
+   `hobkin-lore build peoplesoft-pia ~/repos/ps-tests/ --out packs/peoplesoft-pia`. The build adds what it
+   learns from them; everything already in the pack (written by hand or reviewed) is kept as it is. Then
+   review (Step 4) and compile.
+3. Tests run against a development or test environment, never production (Rule 1), with credentials from
+   environment variables (Rule 2).
+
 ## When a deploy says CONFLICT
 
 Someone else deployed the same object since your pull. Nothing was overwritten. The message shows a command

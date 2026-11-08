@@ -22,6 +22,11 @@
   database's copy with the pulled one first and stops on a difference. Commands are split into words before
   values are filled in (`Workspace.argv`), secrets come only from the environment and are masked
   (`Workspace.mask`). Every operation's command is checked by `check_operations` (compile, review, use).
+- **A lore is one file.** Helper files (`files/` in a pack source) are stored inside it (meta `files`) and
+  written to the skill folder on install, never outside it. A check harness reaches them through `{pack}`; exit
+  77 means "can't check here" (unchecked, never failed).
+- **People's work outlives a rebuild:** entries without a review record (written by hand) or accepted, edited
+  or rejected in review are kept by `build` (`by_hand`).
 - **Every model answer is recorded** (`Model.ask`, `.build/answers/`): a rebuild only asks what changed.
 - **Tests:** `python3 -m unittest discover -v tests` (they compile `packs/jq` and run its examples through jq
   when it's installed; `tests/fake_model.py` stands in for a model, `tests/fakeps.py` for a PeopleSoft-style

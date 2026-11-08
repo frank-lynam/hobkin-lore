@@ -167,6 +167,15 @@ class BuildTest(unittest.TestCase):
         self.assertNotIn("invented", names)                       # rejected: in the source, not in the lore
         self.assertIn("upper", names)
 
+    def test_a_build_extends_a_hand_written_pack(self):
+        self.out.mkdir(parents=True)
+        (self.out / "symbols.jsonl").write_text(json.dumps({"name": "handmade", "kind": "function",
+                                                            "summary": "written by a person"}) + "\n")
+        self.build()
+        rows = {y["name"]: y for y in hl.read_jsonl(self.out / "symbols.jsonl")}
+        self.assertEqual(rows["handmade"]["summary"], "written by a person")   # kept as written
+        self.assertIn("upper", rows)                                            # and the build's added
+
     def test_the_review_page(self):
         self.build()
         srv = hl.review_server(self.out, port=0)
